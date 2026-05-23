@@ -1,36 +1,4 @@
-"""
-colab/deepscalper/utils.py — Feature Engineering for DeepScalper (paper-faithful).
-
-Implements the exact feature sets described in the DeepScalper paper (CIKM '22):
-
-  compute_macro_features(bars_df) → ndarray (n, MACRO_DIM=11)
-      11 macro features from Table 2:
-        z_open, z_high, z_low, z_close, z_adj_close,
-        z_d_5, z_d_10, z_d_15, z_d_20, z_d_25, z_d_30
-
-  compute_micro_features(bars_df) → ndarray (n, LOB_DIM=5)
-      5 intrabar microstructure features (LOB proxy — no real LOB available):
-        range_norm, body, lower_wick, upper_wick, vol_norm
-
-  compute_features(bars_df) → ndarray (n, 11)
-      Alias for compute_macro_features (backward compatibility).
-
-  compute_day_starts(index) → list[int]
-  compute_sharpe(rewards)   → float
-  compute_win_rate(rewards) → float
-"""
-
-import logging
-from typing import List
-
-import numpy as np
-import pandas as pd
-import pytz
-
-logger = logging.getLogger(__name__)
-
-_ET = pytz.timezone("US/Eastern")
-
+"""\ncolab/deepscalper/utils.py — Feature Engineering for DeepScalper (paper-faithful).\n\nImplements the exact feature sets described in the DeepScalper paper (CIKM '22):\n\n  compute_macro_features(bars_df) → ndarray (n, MACRO_DIM=11)\n      11 macro features from Table 2:\n        z_open, z_high, z_low, z_close, z_adj_close,\n        z_d_5, z_d_10, z_d_15, z_d_20, z_d_25, z_d_30\n\n  compute_micro_features(bars_df, lob_snapshots=None, use_proxy=True) → ndarray (n, LOB_DIM=4)\n      V2 CHANGE: Dual-mode (proxy for training, real LOB for inference).\n      4 microstructure features: spread_pct, order_imbalance, depth_ratio, mid_move_1min\n\n  compute_features(bars_df) → ndarray (n, 11)\n      Alias for compute_macro_features (backward compatibility).\n\n  compute_day_starts(index) → list[int]  # V2 CHANGE: UTC midnight boundaries (crypto 24/7)\n  _compute_time_features(index) → ndarray (n, 2)  # V2 CHANGE: UTC sin/cos hour encoding\n  compute_sharpe(rewards)   → float\n  compute_win_rate(rewards) → float\n"""\n\nimport logging\nfrom typing import List, Optional\n\nimport numpy as np\nimport pandas as pd\nimport pytz\n\nlogger = logging.getLogger(__name__)\n\n_ET = pytz.timezone("US/Eastern")\n
 
 # ---------------------------------------------------------------------------
 # Macro features — Table 2 of the paper
@@ -94,58 +62,130 @@ def compute_macro_features(bars: pd.DataFrame) -> np.ndarray:
 
 
 # ---------------------------------------------------------------------------
-# Micro features — LOB proxy (5 intrabar microstructure features)
+# Micro features — Dual-mode (V2 CHANGE: proxy OHLCV or real Alpaca LOB)
 # ---------------------------------------------------------------------------
 
-def compute_micro_features(bars: pd.DataFrame) -> np.ndarray:
-    """Compute 5 intrabar microstructure features (LOB proxy).
+def compute_micro_features(
+    bars: pd.DataFrame,
+    lob_snapshots: Optional[pd.DataFrame] = None,
+    use_proxy: bool = True,
+) -> np.ndarray:
+    """Compute 4 microstructure features — dual-mode for training vs. inference.
 
-    The paper uses actual Limit Order Book (LOB) data; since Alpaca free-tier
-    does not provide LOB for historical bars, we substitute candlestick
-    microstructure signals that capture the same buying/selling pressure.
+    TRAINING MODE (use_proxy=True, default):
+        Reconstructs LOB microstructure from OHLCV candlestick data using
+        proven proxy formulas (Corwin-Schultz, Kyle volume model).
 
-    Features:
-        0  range_norm   = (H - L) / C                    — intrabar volatility
-        1  body         = (C - O) / C                    — candle direction
-        2  lower_wick   = (O - L) / (H - L + ε)         — buying pressure
-        3  upper_wick   = (H - C) / (H - L + ε)         — selling pressure
-        4  vol_norm     = z-score(volume, window=60)     — relative volume
+    INFERENCE MODE (use_proxy=False, lob_snapshots provided):
+        Uses real Alpaca orderbook data (top 3 bid/ask levels).
+        lob_snapshots must have columns:
+            bid_price_1, bid_size_1, bid_price_2, bid_size_2, bid_price_3, bid_size_3
+            ask_price_1, ask_size_1, ask_price_2, ask_size_2, ask_price_3, ask_size_3
+
+    V2 CHANGE: 5 features → 4 features (matches TradeMaster micro feature count):
+        0  spread_pct:      Bid-ask spread as % of mid price
+        1  order_imbalance: (buy_vol - sell_vol) / total_vol in [-1, 1]
+        2  depth_ratio:     bid_depth / ask_depth (log-normalised)
+        3  mid_move_1min:   Close pct change clipped to [-5%, +5%]
+
+    IMPORTANT: Feature names and ORDER are identical in both modes so that
+    a model trained on proxies can be used directly with real LOB features.
 
     Args:
-        bars: DataFrame with OHLCV columns and a DatetimeIndex.
+        bars: DataFrame with OHLCV columns and DatetimeIndex.
+        lob_snapshots: Optional real orderbook snapshot DataFrame.
+        use_proxy: If True, use OHLCV proxy; if False, use lob_snapshots.
 
     Returns:
-        float32 array of shape (len(bars), 5).
+        float32 array of shape (len(bars), 4).
     """
     df = bars.copy()
     df.columns = [c.lower() for c in df.columns]
 
-    o = df["open"].astype(float)
-    h = df["high"].astype(float)
-    l = df["low"].astype(float)
-    c = df["close"].astype(float)
-    v = df["volume"].astype(float)
+    if use_proxy or lob_snapshots is None:
+        # ----------------------------------------------------------------
+        # PROXY MODE: reconstruct from OHLCV
+        # ----------------------------------------------------------------
+        o = df["open"].astype(float)
+        h = df["high"].astype(float)
+        l = df["low"].astype(float)
+        c = df["close"].astype(float)
+        v = df["volume"].astype(float)
 
-    hl = (h - l).replace(0.0, 1e-8)
+        # 1. Spread proxy (Corwin-Schultz simplified for 1-min bars)
+        spread_pct = ((h - l) / ((h + l) / 2 + 1e-10)).clip(0.0, 0.05)
 
-    range_norm  = ((h - l) / (c + 1e-10)).clip(0.0, 0.05) / 0.05
-    body        = ((c - o) / (c + 1e-10)).clip(-0.05, 0.05) / 0.05
-    lower_wick  = ((o - l) / hl).clip(0.0, 1.0)
-    upper_wick  = ((h - c) / hl).clip(0.0, 1.0)
+        # 2. Order imbalance proxy (Kyle 1985: up-bars = buy-driven)
+        price_direction = np.sign(c - o)
+        buy_vol  = v * (price_direction > 0).astype(float)
+        sell_vol = v * (price_direction < 0).astype(float)
+        total_vol = buy_vol + sell_vol
+        order_imbalance = np.where(
+            total_vol > 0,
+            (buy_vol - sell_vol) / total_vol,
+            0.0,
+        ).clip(-1.0, 1.0)
 
-    vol_mean = v.rolling(60, min_periods=1).mean()
-    vol_std  = v.rolling(60, min_periods=1).std().fillna(1.0).replace(0.0, 1.0)
-    vol_norm = ((v - vol_mean) / vol_std).clip(-3.0, 3.0) / 3.0
+        # 3. Depth ratio proxy: rolling volume ratio as bid/ask depth stand-in
+        vol_5   = v.rolling(5, min_periods=1).sum()
+        vol_p5  = v.shift(5).rolling(5, min_periods=1).sum().fillna(vol_5)
+        depth_ratio = (np.log((vol_5 / (vol_p5 + 1e-8)).clip(0.1, 10.0))).values / 3.0
 
-    features = np.column_stack([
-        range_norm.values,
-        body.values,
-        lower_wick.values,
-        upper_wick.values,
-        vol_norm.values,
-    ]).astype(np.float32)
+        # 4. Mid-price 1-min return
+        mid_move = c.pct_change().fillna(0.0).clip(-0.05, 0.05)
 
-    return np.nan_to_num(features, nan=0.0, posinf=1.0, neginf=-1.0)
+        features = np.column_stack([
+            spread_pct.values,
+            order_imbalance,
+            depth_ratio,
+            mid_move.values,
+        ]).astype(np.float32)
+
+    else:
+        # ----------------------------------------------------------------
+        # REAL LOB MODE: compute from Alpaca orderbook snapshots
+        # ----------------------------------------------------------------
+        mid_price = (
+            lob_snapshots["bid_price_1"] + lob_snapshots["ask_price_1"]
+        ) / 2
+
+        # 1. Real spread
+        spread_pct = (
+            (lob_snapshots["ask_price_1"] - lob_snapshots["bid_price_1"])
+            / (mid_price + 1e-10)
+        ).clip(0.0, 0.05)
+
+        # 2. Real order imbalance (top 3 levels)
+        bid_vol = (
+            lob_snapshots["bid_size_1"]
+            + lob_snapshots["bid_size_2"]
+            + lob_snapshots["bid_size_3"]
+        )
+        ask_vol = (
+            lob_snapshots["ask_size_1"]
+            + lob_snapshots["ask_size_2"]
+            + lob_snapshots["ask_size_3"]
+        )
+        order_imbalance = (
+            (bid_vol - ask_vol) / (bid_vol + ask_vol + 1e-8)
+        ).clip(-1.0, 1.0)
+
+        # 3. Real depth ratio (log-normalised)
+        depth_ratio = np.log(
+            (bid_vol / (ask_vol + 1e-8)).clip(0.01, 100.0)
+        ).clip(-3.0, 3.0) / 3.0
+
+        # 4. Mid-price 1-min return
+        mid_move = mid_price.pct_change().fillna(0.0).clip(-0.05, 0.05)
+
+        features = np.column_stack([
+            spread_pct.values,
+            order_imbalance.values,
+            depth_ratio.values,
+            mid_move.values,
+        ]).astype(np.float32)
+
+    return np.nan_to_num(features, nan=0.0, posinf=0.05, neginf=-0.05)
 
 
 # ---------------------------------------------------------------------------
@@ -158,7 +198,10 @@ def compute_features(bars: pd.DataFrame) -> np.ndarray:
 
 
 def _session_time_feature(index: pd.DatetimeIndex) -> np.ndarray:
-    """Session-time fraction (kept for any legacy references)."""
+    """Legacy ET session-time feature — kept for backward compatibility only.
+
+    V2 CHANGE: Replaced by _compute_time_features() for 24/7 crypto markets.
+    """
     _MARKET_OPEN = 9 * 60 + 30
     _SESSION_DURATION = 390
     out = np.zeros(len(index))
@@ -172,6 +215,33 @@ def _session_time_feature(index: pd.DatetimeIndex) -> np.ndarray:
     return out
 
 
+def _compute_time_features(index: pd.DatetimeIndex) -> np.ndarray:
+    """V2 CHANGE: UTC cyclical hour-of-day features for 24/7 crypto markets.
+
+    Rationale: Crypto has real time-of-day patterns even without formal sessions
+    (Asia 00:00-08:00 UTC, Europe 07:00-16:00 UTC, US 13:00-21:00 UTC).
+    Sin/cos encoding prevents the model from treating 23:59 and 00:01 as
+    maximally different — they are adjacent, not opposite.
+
+    Matches TradeMaster's time feature implementation convention.
+
+    Args:
+        index: DatetimeIndex of the bar series.
+
+    Returns:
+        float32 array of shape (N, 2): columns are [sin_hour, cos_hour].
+    """
+    if index.tzinfo is None:
+        index = index.tz_localize("UTC")
+    else:
+        index = index.tz_convert("UTC")
+
+    hour_of_day = index.hour + index.minute / 60.0   # e.g. 14:30 → 14.5
+    sin_hour = np.sin(2 * np.pi * hour_of_day / 24.0).astype(np.float32)
+    cos_hour = np.cos(2 * np.pi * hour_of_day / 24.0).astype(np.float32)
+    return np.stack([sin_hour, cos_hour], axis=1)  # (N, 2)
+
+
 
 
 # ---------------------------------------------------------------------------
@@ -179,27 +249,30 @@ def _session_time_feature(index: pd.DatetimeIndex) -> np.ndarray:
 # ---------------------------------------------------------------------------
 
 def compute_day_starts(index: pd.DatetimeIndex) -> List[int]:
-    """Find integer indices where each new trading day begins.
+    """Find integer indices where each new UTC calendar day begins.
+
+    V2 CHANGE: Uses UTC midnight boundaries instead of US/Eastern session starts.
+    For 24/7 crypto assets, a 'day' is defined as UTC 00:00 to 23:59.
+    TradeMaster uses this same convention for all continuous markets.
 
     Args:
         index: DatetimeIndex of the full feature dataset (may span many days).
 
     Returns:
-        Sorted list of integer positions where each day's first bar is located.
+        Sorted list of integer positions where each UTC day's first bar is located.
     """
+    # V2 CHANGE: Convert to UTC (was US/Eastern)
     if index.tzinfo is None:
-        index = index.tz_localize("UTC").tz_convert(_ET)
+        index = index.tz_localize("UTC")
     else:
-        index = index.tz_convert(_ET)
+        index = index.tz_convert("UTC")
 
-    dates = []
-    current_date = None
-    for i, ts in enumerate(index):
-        day = ts.date()
-        if day != current_date:
-            current_date = day
-            dates.append(i)
-    return dates
+    dates = index.date
+    day_starts = [0]  # First bar is always a day start
+    for i in range(1, len(dates)):
+        if dates[i] != dates[i - 1]:
+            day_starts.append(i)
+    return day_starts
 
 
 # ---------------------------------------------------------------------------

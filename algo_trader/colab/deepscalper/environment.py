@@ -8,41 +8,42 @@ Faithful implementation of the trading environment described in:
 Key paper-faithful design choices:
 
 Observation Space (Dict):
-    'lob'   : Box(seq_len, LOB_DIM=5)    — micro sequence (LOB proxy)
+    'lob'   : Box(seq_len, LOB_DIM=4)    — micro sequence (dual-mode: proxy or real LOB)
     'priv'  : Box(seq_len, PRIV_DIM=2)   — private state: (position_flag, unrealized_pnl%)
     'macro' : Box(MACRO_DIM=11,)          — current bar macro features (Table 2)
 
-Action Space: MultiDiscrete([N_DIR=3, N_SIZE=4])
-    Direction : 0=HOLD  1=BUY  2=SELL
-    Size      : 0=25%   1=50%  2=75%   3=100%  (of max_notional)
+Action Space (V2 CHANGE): Discrete(2)
+    0 = FLAT: If currently long → exit. If already flat → hold.
+    1 = LONG: If currently flat → enter. If already long → hold.
+    (No short selling — Alpaca crypto does not support short positions.)
 
-Reward:
-    r_t = log(P_{t+1} / P_t) × position (mark-to-market P&L)
-    Hindsight bonus (training only, applied in agent.store()):
-        r_H = r_t + w × log(P_{t+h} / P_t) × position   (Section 4.2)
+Reward (V2 CHANGE — TradeMaster-aligned):
+    r_t = log_return × position                     (immediate mark-to-market P&L)
+          + ω × max_future_log_return              (hindsight bonus, training-only)
+          - α × rolling_return_std                 (risk-aware auxiliary task)
+    Where ω = 0.2 (HINDSIGHT_WEIGHT) and h = 10 (HINDSIGHT_HORIZON)
 
-Vol target (info dict):
-    info['vol_target'] = std(z_close) over lookback window — for the
-    volatility auxiliary task (Section 4.4).
+Transaction cost (V2 CHANGE):
+    0.0025 (25 bps per side, Alpaca crypto taker fee)
 
 Episode lifecycle:
-    • One episode = one full trading day (day-start to day-end).
-    • The environment cycles through pre-computed days randomly during training.
+    • One episode = one full UTC calendar day (midnight to midnight).
+    • The environment cycles through pre-computed UTC days randomly during training.
     • Private state history is a deque of (position_flag, unrealized_pnl_pct)
       maintained over the lookback window.
 
 Usage:
     env = ScalperEnv(
-        lob_features   = lob_arr,     # (n_bars, 5)
+        lob_features   = lob_arr,     # (n_bars, 4)  <- V2: 4 features
         macro_features = macro_arr,   # (n_bars, 11)
         close_prices   = close_arr,   # (n_bars,)
-        day_starts     = [0, 390, …], # day boundary indices from compute_day_starts
-        lookback_bars  = 60,
+        day_starts     = [0, 1440, …], # UTC day boundary indices
+        lookback_bars  = 10,           # V2: 10 bars
         max_notional   = 10_000.0,
-        transaction_cost_pct = 0.001,
+        transaction_cost_pct = 0.0025, # V2: 25 bps
     )
     obs, info = env.reset()
-    obs, reward, terminated, truncated, info = env.step(np.array([1, 2]))
+    obs, reward, terminated, truncated, info = env.step(1)  # V2: int, not array
 """
 
 import logging
@@ -56,29 +57,24 @@ from gymnasium import spaces
 
 logger = logging.getLogger(__name__)
 
-# Size-branch → fraction of max_notional mapping
-_SIZE_FRACTIONS = [0.25, 0.50, 0.75, 1.00]
-
-# Action branch indices
-_HOLD = 0
-_BUY  = 1
-_SELL = 2
+# V2 CHANGE: Binary action semantics (no short selling on Alpaca crypto)
+_FLAT = 0
+_LONG = 1
 
 
 class ScalperEnv(gym.Env):
-    """DeepScalper intraday trading environment.
+    """DeepScalper trading environment — V2: 24/7 crypto, binary LONG/FLAT actions.
 
     Args:
-        lob_features          : Pre-computed LOB/micro features  (n_bars, LOB_DIM).
-        macro_features        : Pre-computed macro features       (n_bars, MACRO_DIM).
+        lob_features          : Pre-computed LOB/micro features  (n_bars, LOB_DIM=4).
+        macro_features        : Pre-computed macro features       (n_bars, MACRO_DIM=11).
         close_prices          : Raw close prices array            (n_bars,).
-        day_starts            : List of integer indices where each trading day begins.
-        lookback_bars         : Number of bars in the observation window (T in the paper).
+        day_starts            : UTC day boundary indices from compute_day_starts().
+        lookback_bars         : Number of bars in the observation window (10 in V2).
         max_notional          : Maximum position size in dollars.
-        transaction_cost_pct  : One-way transaction cost as fraction of trade value.
-        hindsight_horizon     : h — look-ahead bars for hindsight bonus (default 60).
-        n_dir                 : Direction branch actions  (default 3).
-        n_size                : Size branch actions       (default 4).
+        transaction_cost_pct  : One-way transaction cost (0.0025 for Alpaca crypto).
+        hindsight_horizon     : h — look-ahead bars for hindsight bonus (10 in V2).
+        hindsight_weight      : ω — hindsight bonus coefficient (0.2 in V2).
     """
 
     metadata = {"render_modes": []}
@@ -89,12 +85,11 @@ class ScalperEnv(gym.Env):
         macro_features:       np.ndarray,
         close_prices:         np.ndarray,
         day_starts:           List[int],
-        lookback_bars:        int   = 60,
+        lookback_bars:        int   = 10,       # V2 CHANGE: was 60
         max_notional:         float = 10_000.0,
-        transaction_cost_pct: float = 0.001,
-        hindsight_horizon:    int   = 60,
-        n_dir:                int   = 3,
-        n_size:               int   = 4,
+        transaction_cost_pct: float = 0.0025,  # V2 CHANGE: was 0.001 (25 bps crypto)
+        hindsight_horizon:    int   = 10,       # V2 CHANGE: was 60 (TradeMaster: 5 bars)
+        hindsight_weight:     float = 0.2,      # V2 CHANGE: was 0.01 (TradeMaster default)
     ) -> None:
         super().__init__()
 
@@ -107,6 +102,7 @@ class ScalperEnv(gym.Env):
         self.max_notional        = max_notional
         self.transaction_cost_pct = transaction_cost_pct
         self.hindsight_horizon   = hindsight_horizon
+        self.hindsight_weight    = hindsight_weight
 
         lob_dim   = self.lob_features.shape[1]
         macro_dim = self.macro_features.shape[1]
@@ -121,15 +117,16 @@ class ScalperEnv(gym.Env):
             'macro': spaces.Box(-np.inf, np.inf, shape=(macro_dim,),               dtype=np.float32),
         })
 
-        # Action space: MultiDiscrete([n_dir, n_size])
-        self.action_space = spaces.MultiDiscrete([n_dir, n_size])
+        # V2 CHANGE: Binary action space — 0=FLAT, 1=LONG (no short selling)
+        self.action_space = spaces.Discrete(2)
 
         # Episode state (reset in reset())
-        self._day_idx:     int   = 0
-        self._t:           int   = 0
-        self._day_end:     int   = 0
-        self._position:    int   = 0      # +1 long, -1 short, 0 flat
-        self._entry_price: float = 0.0
+        self._day_idx:      int   = 0
+        self._t:            int   = 0
+        self._day_end:      int   = 0
+        self._position:     int   = 0      # 0=flat, 1=long (never -1 in V2)
+        self._entry_price:  float = 0.0
+        self._returns_history: deque = deque(maxlen=100)
         self._priv_history: deque = deque(maxlen=lookback_bars)
 
     # ------------------------------------------------------------------
@@ -153,6 +150,7 @@ class ScalperEnv(gym.Env):
 
         self._position    = 0
         self._entry_price = 0.0
+        self._returns_history.clear()
         self._priv_history = deque(
             [np.zeros(2, dtype=np.float32)] * self.lookback_bars,
             maxlen=self.lookback_bars,
@@ -169,95 +167,132 @@ class ScalperEnv(gym.Env):
     # ------------------------------------------------------------------
 
     def step(
-        self, action: np.ndarray
+        self, action: int
     ) -> Tuple[Dict[str, np.ndarray], float, bool, bool, Dict[str, Any]]:
         """Execute one bar step.
 
+        V2 CHANGE: action is a single int (0=FLAT, 1=LONG), not an array.
+        Position is always 0 (flat) or 1 (long) — never -1 (short).
+
         Args:
-            action : np.ndarray of shape (2,) — [dir_action, size_action].
+            action : int — 0=FLAT (exit long or hold flat), 1=LONG (enter or hold long).
 
         Returns:
             obs, reward, terminated, truncated, info
         """
-        dir_action  = int(action[0])
-        size_action = int(action[1])
-        fraction    = _SIZE_FRACTIONS[size_action]
-
+        action = int(action)
         current_price = float(self.close_prices[self._t])
         next_t        = self._t + 1
         next_price    = float(self.close_prices[min(next_t, self._day_end)])
 
-        cost = 0.0
         prev_position = self._position
 
-        # ---- Execute action ----
-        if dir_action == _BUY and self._position <= 0:
-            if self._position < 0:
-                # Close short
-                pnl = (self._entry_price - current_price) / (self._entry_price + 1e-10)
-                cost += self.transaction_cost_pct
-            self._position    = 1
-            self._entry_price = current_price
-            cost += self.transaction_cost_pct
+        # V2 CHANGE: Map binary action to position (no short allowed)
+        new_position = action   # 1=LONG, 0=FLAT (directly)
+        trade_occurred = int(new_position != prev_position)
+        transaction_cost = trade_occurred * self.transaction_cost_pct
 
-        elif dir_action == _SELL and self._position >= 0:
-            if self._position > 0:
-                # Close long
-                pnl = (current_price - self._entry_price) / (self._entry_price + 1e-10)
-                cost += self.transaction_cost_pct
-            self._position    = -1
-            self._entry_price = current_price
-            cost += self.transaction_cost_pct
-
-        # HOLD: keep current position unchanged
-
-        # ---- Compute step reward (log return × position) ----
-        if self._position != 0 and current_price > 0:
+        # Compute log return (realised only while long)
+        if prev_position == 1 and current_price > 0:
             log_ret = float(np.log(next_price / current_price))
-            reward  = log_ret * self._position - cost
         else:
-            reward = -cost
+            log_ret = 0.0
 
-        # ---- Unrealized P&L for private state ----
-        if self._position != 0 and self._entry_price > 0:
-            unreal_pnl = (
-                (current_price - self._entry_price) / self._entry_price * self._position
-            )
+        immediate_reward = log_ret - transaction_cost
+
+        # Update position and entry price
+        if trade_occurred:
+            if new_position == _LONG:
+                self._entry_price = current_price
+            else:
+                self._entry_price = 0.0
+        self._position = new_position
+
+        # Track returns for risk penalty
+        self._returns_history.append(log_ret if prev_position == 1 else 0.0)
+
+        # V2 CHANGE: Full reward with hindsight bonus + risk penalty
+        reward = self._compute_reward(immediate_reward, current_price, prev_position)
+
+        # Unrealized P&L for private state
+        if self._position == 1 and self._entry_price > 0:
+            unreal_pnl = (current_price - self._entry_price) / self._entry_price
         else:
             unreal_pnl = 0.0
 
-        # ---- Update private state history ----
-        pos_flag = 1.0 if self._position != 0 else 0.0
+        # Update private state history
         self._priv_history.append(
-            np.array([pos_flag, float(np.clip(unreal_pnl, -0.5, 0.5))], dtype=np.float32)
+            np.array([float(self._position), float(np.clip(unreal_pnl, -0.5, 0.5))],
+                     dtype=np.float32)
         )
 
-        # ---- Advance time ----
+        # Advance time
         self._t = next_t
         terminated = self._t >= self._day_end
 
-        # ---- Volatility target for auxiliary task ----
-        # std of z_close over lookback window (macro feature index 3)
+        # Volatility target for auxiliary task (std of z_close over lookback)
         win_start  = max(0, self._t - self.lookback_bars)
-        win_end    = self._t
-        z_close_win = self.macro_features[win_start:win_end, 3]  # z_close
+        z_close_win = self.macro_features[win_start:self._t, 3]
         vol_target  = float(z_close_win.std()) if len(z_close_win) > 1 else 0.0
-
-        # ---- Hindsight future price (stored in info for agent to use) ----
-        h_idx = min(self._t + self.hindsight_horizon, self._day_end)
-        future_price = float(self.close_prices[h_idx])
 
         info = {
             'vol_target':    vol_target,
             'current_price': current_price,
-            'future_price':  future_price,
-            'position':      prev_position,
-            'dir_action':    dir_action,
-            'size_action':   size_action,
+            'position':      self._position,
+            'log_return':    log_ret,
         }
 
         obs = self._get_obs()
         return obs, reward, terminated, False, info
+
+    # ------------------------------------------------------------------
+    # V2 CHANGE: DeepScalper reward function (TradeMaster-aligned)
+    # ------------------------------------------------------------------
+
+    def _compute_reward(self, immediate: float, current_price: float, prev_position: int) -> float:
+        """DeepScalper reward with hindsight bonus + risk-aware penalty.
+
+        Formula (Section 3.3 of the paper, TradeMaster-aligned parameters):
+            r_t = immediate_log_return
+                  + ω × best_future_log_return  (hindsight — training-only oracle)
+                  - α × rolling_return_std       (risk-aware auxiliary task)
+
+        Where:
+            ω = hindsight_weight = 0.2  (TradeMaster: future_weights=0.2)
+            h = hindsight_horizon = 10  (TradeMaster: forward_num_day=5)
+            α = 0.01                    (keeps risk signal as regulariser)
+
+        CRITICAL: The hindsight bonus uses future prices accessible only in
+        training. It is NEVER used during inference. It acts as a coaching
+        signal that accelerates learning without introducing lookahead bias.
+
+        Args:
+            immediate:     Already-computed log_return minus transaction cost.
+            current_price: Price at the current bar.
+            prev_position: Position held before this step (0=flat, 1=long).
+
+        Returns:
+            Scalar total reward.
+        """
+        # Component 1: Immediate return (already computed in step())
+        total = immediate
+
+        # Component 2: Hindsight bonus (training oracle, long position only)
+        if prev_position == 1:
+            future_end = min(self._t + self.hindsight_horizon, self._day_end)
+            if future_end > self._t:
+                future_prices = self.close_prices[self._t:future_end]
+                best_future = float(np.max(
+                    np.log(future_prices / (current_price + 1e-10) + 1e-10)
+                ))
+                total += self.hindsight_weight * max(best_future, 0.0)
+
+        # Component 3: Risk-aware auxiliary task (penalise return variance)
+        if len(self._returns_history) >= 10:
+            recent = np.array(list(self._returns_history)[-20:])
+            total -= 0.01 * float(np.std(recent))
+
+        return total
 
     # ------------------------------------------------------------------
     # Observation assembly
