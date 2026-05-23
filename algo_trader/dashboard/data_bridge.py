@@ -27,9 +27,9 @@ class PositionSnapshot:
     """Immutable snapshot of a single open position at a point in time.
 
     Attributes:
-        symbol: Stock ticker symbol.
-        side: "LONG" or "SHORT".
-        qty: Absolute share quantity.
+        symbol: Trading symbol (e.g., "BTC/USD").
+        side: "LONG" or "FLAT".
+        qty: Absolute position quantity.
         entry_price: Average fill price of the opening order.
         current_price: Most recent market price.
         unrealized_pnl: Unrealised P&L in USD = (current_price − entry_price) × qty.
@@ -54,9 +54,9 @@ class ModelSignal:
     """Latest inference output for a single ticker from the DeepScalper model.
 
     Attributes:
-        symbol: Stock ticker symbol.
-        action: "BUY", "SELL", or "HOLD".
-        q_values: Raw Q-values as a 3-element list [Q_HOLD, Q_BUY, Q_SELL].
+        symbol: Trading symbol (e.g., "BTC/USD").
+        action: "LONG" or "FLAT".
+        q_values: Raw Q-values as a 2-element list [Q_FLAT, Q_LONG].
         confidence: Softmax-max score in [0, 1] indicating action certainty.
         timestamp: HH:MM:SS Eastern Time string of the inference.
     """
@@ -74,9 +74,9 @@ class TradeEvent:
 
     Attributes:
         timestamp: HH:MM:SS Eastern Time string.
-        symbol: Affected ticker symbol, or "ALL" for portfolio-wide events.
+        symbol: Affected symbol, or "ALL" for portfolio-wide events.
         side: "BUY", "SELL", or descriptive string for non-trade events.
-        qty: Share quantity (0 for non-trade events).
+        qty: Trade quantity (0 for non-trade events).
         price: Fill price (0.0 for non-trade events).
         event_type: Category label: "FILL", "HALT", "EOD_CLOSE", "STOP_HIT", etc.
     """
@@ -102,7 +102,7 @@ class DataBridge:
     is mid-iteration.
 
     Usage (Lumibot thread):
-        bridge.update_signal("AAPL", ModelSignal(...))
+        bridge.update_signal("BTC/USD", ModelSignal(...))
         bridge.append_trade_event(TradeEvent(...))
 
     Usage (PyQt5 thread — inside QTimer slot):

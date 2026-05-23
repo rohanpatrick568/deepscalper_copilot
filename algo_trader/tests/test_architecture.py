@@ -100,17 +100,17 @@ class TestVolatilityHead:
 
 
 # ===========================================================================
-# DeepScalperNet — original defaults (N_DIR=3, LOB_DIM=5)
+# DeepScalperNet — V2 defaults (N_DIR=2, LOB_DIM=4)
 # ===========================================================================
 
 class TestDeepScalperNetDefaults:
     @pytest.fixture
     def net(self):
         torch.manual_seed(0)
-        return DeepScalperNet()   # defaults: n_dir=3, n_size=4, lob_dim=5
+        return DeepScalperNet()   # defaults: n_dir=2, n_size=1, lob_dim=4
 
     def _batch(self, net, batch=2, seq=10):
-        lob   = _rand((batch, seq, 5))
+        lob   = _rand((batch, seq, 4))
         priv  = _rand((batch, seq, 2))
         macro = _rand((batch, 11))
         return net(lob, priv, macro)
@@ -121,11 +121,11 @@ class TestDeepScalperNetDefaults:
 
     def test_q_dir_shape(self, net):
         q_dir, *_ = self._batch(net)
-        assert q_dir.shape == (2, 3)    # batch=2, N_DIR=3
+        assert q_dir.shape == (2, 2)    # batch=2, N_DIR=2
 
     def test_q_size_shape(self, net):
         _, q_size, _ = self._batch(net)
-        assert q_size.shape == (2, 4)   # batch=2, N_SIZE=4
+        assert q_size.shape == (2, 1)   # batch=2, N_SIZE=1
 
     def test_vol_shape(self, net):
         _, _, vol = self._batch(net)

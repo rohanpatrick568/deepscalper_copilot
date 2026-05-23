@@ -3,7 +3,7 @@ main.py — AlgoTrader System Entry Point.
 
 Starts the complete DeepScalper × Alpaca paper trading system:
   1. Validates environment (.env) and credentials.
-  2. Verifies all 100 weight files exist in ./weights/.
+    2. Verifies all configured crypto weight files exist in ./weights/.
   3. Starts Lumibot trading engine in a background daemon thread.
   4. Starts PyQt5 dashboard in the main thread (required by Qt).
 
@@ -46,7 +46,7 @@ def _validate_environment() -> None:
     Raises:
         SystemExit: On any validation failure.
     """
-    from config import ALPACA_API_KEY, ALPACA_SECRET_KEY, SP100_TICKERS, WEIGHTS_DIR
+    from config import ALPACA_API_KEY, ALPACA_SECRET_KEY, CRYPTO_PAIRS, WEIGHTS_DIR
 
     # 1. Credentials check
     if not ALPACA_API_KEY or not ALPACA_SECRET_KEY:
@@ -70,11 +70,11 @@ def _validate_environment() -> None:
         logger.critical("Alpaca credential verification failed: %s — aborting.", exc)
         sys.exit(1)
 
-    # 3. Weight files check
+    # 3. Weight files check (V2: one file per configured crypto pair)
     missing = [
-        ticker
-        for ticker in SP100_TICKERS
-        if not (WEIGHTS_DIR / f"{ticker}.pth").exists()
+        pair
+        for pair in CRYPTO_PAIRS
+        if not (WEIGHTS_DIR / f"{pair.replace('/', '_')}.pth").exists()
     ]
     if missing:
         logger.critical(
@@ -86,7 +86,7 @@ def _validate_environment() -> None:
         )
         sys.exit(1)
 
-    logger.info("All %d weight files verified ✓", len(SP100_TICKERS))
+    logger.info("All %d crypto weight file(s) verified ✓", len(CRYPTO_PAIRS))
 
 
 def _run_lumibot(bridge) -> None:
@@ -96,13 +96,16 @@ def _run_lumibot(bridge) -> None:
         bridge: Shared DataBridge instance passed to the strategy.
     """
     try:
+        from config import ALPACA_API_KEY, ALPACA_SECRET_KEY
         from execution.broker import get_broker
-        from execution.strategy import MultiStockDeepScalper
+        from execution.strategy import CryptoDeepScalper
 
         broker = get_broker()
-        strategy = MultiStockDeepScalper(
+        strategy = CryptoDeepScalper(
             broker=broker,
             data_bridge=bridge,
+            alpaca_api_key=ALPACA_API_KEY,
+            alpaca_secret_key=ALPACA_SECRET_KEY,
         )
         logger.info("Starting Lumibot trading engine…")
         strategy.run_all()

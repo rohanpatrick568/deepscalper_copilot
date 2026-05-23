@@ -1,15 +1,15 @@
 """
-dashboard/confidence_panel.py — Per-Stock Model Signal Panel.
+dashboard/confidence_panel.py — Per-Symbol Model Signal Panel.
 
-Displays a scrollable grid of cards, one per S&P 100 ticker.
-Each card shows the model's latest action (BUY / SELL / HOLD),
+Displays a scrollable grid of cards, one per active symbol.
+Each card shows the model's latest action (LONG / FLAT),
 Q-values, and confidence score.
 
 Cards are:
-  • Sorted by confidence descending (highest conviction at top).
-  • Only shown when confidence > CONFIDENCE_THRESHOLD OR the ticker
-    is currently held as an open position.
-  • Colour-coded: BUY = teal, SELL = red, HOLD = grey.
+    • Sorted by confidence descending (highest conviction at top).
+    • Only shown when confidence > CONFIDENCE_THRESHOLD OR the symbol
+        is currently held as an open position.
+    • Colour-coded: LONG = teal, FLAT = grey.
 """
 
 from typing import Dict, Set
@@ -45,28 +45,30 @@ def _action_color(action: str) -> str:
     """Map action string to display colour.
 
     Args:
-        action: "BUY", "SELL", or "HOLD".
+        action: "LONG" or "FLAT" (legacy values map safely).
 
     Returns:
         CSS hex colour string.
     """
     return {
+        "LONG": _TEAL,
         "BUY": _TEAL,
-        "SELL": _RED,
+        "FLAT": _GREY,
         "HOLD": _GREY,
+        "SELL": _RED,
     }.get(action, _GREY)
 
 
 def _action_arrow(action: str) -> str:
     """Map action to a directional arrow character."""
-    return {"BUY": "↑", "SELL": "↓", "HOLD": "—"}.get(action, "—")
+    return {"LONG": "↑", "BUY": "↑", "FLAT": "—", "HOLD": "—", "SELL": "↓"}.get(action, "—")
 
 
 class _SignalCard(QFrame):
-    """A compact display card for a single ticker's model signal.
+    """A compact display card for a single symbol's model signal.
 
     Args:
-        symbol: Stock ticker symbol.
+        symbol: Trading symbol string.
         parent: Parent widget.
     """
 
@@ -122,7 +124,7 @@ class _SignalCard(QFrame):
         action_layout.addStretch()
         action_layout.addWidget(self._conf_label)
 
-        self._q_label = QLabel("Q: H=— B=— S=—")
+        self._q_label = QLabel("Q: F=— L=—")
         q_font = QFont("Consolas", 8)
         self._q_label.setFont(q_font)
         self._q_label.setStyleSheet(f"color: {_GREY}; border: none;")
@@ -154,11 +156,10 @@ class _SignalCard(QFrame):
         conf_pct = signal.confidence * 100
         self._conf_label.setText(f"Conf: {conf_pct:.1f}%")
 
-        if len(signal.q_values) >= 3:
+        if len(signal.q_values) >= 2:
             self._q_label.setText(
-                f"Q: H={signal.q_values[0]:.2f}  "
-                f"B={signal.q_values[1]:.2f}  "
-                f"S={signal.q_values[2]:.2f}"
+                f"Q: F={signal.q_values[0]:.2f}  "
+                f"L={signal.q_values[1]:.2f}"
             )
 
         ts_suffix = " [HELD]" if is_held else ""
@@ -183,7 +184,7 @@ class _SignalCard(QFrame):
 
 
 class ConfidencePanel(QWidget):
-    """Scrollable panel of per-ticker model signal cards.
+    """Scrollable panel of per-symbol model signal cards.
 
     Args:
         data_bridge: Shared DataBridge instance.

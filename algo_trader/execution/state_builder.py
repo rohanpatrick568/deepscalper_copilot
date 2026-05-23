@@ -4,7 +4,7 @@ execution/state_builder.py — Live Bar Data → DeepScalper Observation Dict.
 Bridge between Lumibot's live bar DataFrame and the DeepScalperNet model.
 
 Returns a dict observation matching the format expected by the network:
-    'lob'   : torch.FloatTensor  shape (1, seq_len, LOB_DIM=5)   — micro features
+    'lob'   : torch.FloatTensor  shape (1, seq_len, LOB_DIM=4)   — micro features
     'priv'  : torch.FloatTensor  shape (1, seq_len, PRIV_DIM=2)  — private state
     'macro' : torch.FloatTensor  shape (1, MACRO_DIM=11)          — macro features
 
@@ -14,12 +14,13 @@ training and inference pipelines are identical.
 Usage:
     from execution.state_builder import build_observation
     obs = build_observation(bars_df, position=1, unrealized_pnl_pct=0.003)
-    # obs['lob']  : (1, 60, 5)
-    # obs['priv'] : (1, 60, 2)
+    # obs['lob']  : (1, LOOKBACK_BARS, 4)
+    # obs['priv'] : (1, LOOKBACK_BARS, 2)
     # obs['macro']: (1, 11)
 """
 
 import logging
+from typing import Optional
 
 import numpy as np
 import torch
@@ -34,6 +35,7 @@ def build_observation(
     bars,
     position:            int   = 0,
     unrealized_pnl_pct:  float = 0.0,
+    lob_override: Optional[np.ndarray] = None,
     device:              str   = "cpu",
 ) -> dict:
     """Build a DeepScalperNet observation dict from a raw OHLCV bar DataFrame.
@@ -41,8 +43,11 @@ def build_observation(
     Args:
         bars               : pandas DataFrame with OHLCV columns and DatetimeIndex.
                              Must have at least LOOKBACK_BARS rows.
-        position           : Current position flag: +1 long, -1 short, 0 flat.
+        position           : Current position flag: 1 long, 0 flat.
         unrealized_pnl_pct : Unrealized P&L as a fraction of notional.
+        lob_override       : Optional micro-feature override array with shape
+                     (n, LOB_DIM) or (1, LOB_DIM). Used by live strategy
+                     to inject real/proxy LOB features directly.
         device             : PyTorch device string.
 
     Returns:
@@ -53,11 +58,28 @@ def build_observation(
 
     # ---- Compute feature matrices ----
     macro_arr = compute_macro_features(bars)   # (n, 11)
-    lob_arr   = compute_micro_features(bars)   # (n, 5)
+
+    if lob_override is None:
+        lob_arr = compute_micro_features(bars, use_proxy=True)   # (n, LOB_DIM)
+    else:
+        lob_arr = np.asarray(lob_override, dtype=np.float32)
+        if lob_arr.ndim == 1:
+            lob_arr = lob_arr.reshape(1, -1)
+        if lob_arr.shape[1] != LOB_DIM:
+            raise ValueError(f"lob_override must have shape (*, {LOB_DIM}), got {lob_arr.shape}")
+
+        n_bars = len(bars)
+        if lob_arr.shape[0] == 1:
+            lob_arr = np.repeat(lob_arr, n_bars, axis=0)
+        elif lob_arr.shape[0] > n_bars:
+            lob_arr = lob_arr[-n_bars:]
+        elif lob_arr.shape[0] < n_bars:
+            pad = np.zeros((n_bars - lob_arr.shape[0], LOB_DIM), dtype=np.float32)
+            lob_arr = np.vstack([pad, lob_arr])
 
     # Take the last seq_len rows
     macro_seq = macro_arr[-seq_len:]  # (seq_len, 11)
-    lob_seq   = lob_arr[-seq_len:]    # (seq_len, 5)
+    lob_seq   = lob_arr[-seq_len:]    # (seq_len, LOB_DIM)
 
     # Pad to seq_len if bars are insufficient
     if macro_seq.shape[0] < seq_len:
@@ -80,8 +102,8 @@ def build_observation(
         return torch.tensor(arr, dtype=torch.float32, device=device).unsqueeze(0)
 
     return {
-        'lob':   _t(lob_seq),         # (1, 60, 5)
-        'priv':  _t(priv_seq),        # (1, 60, 2)
+        'lob':   _t(lob_seq),         # (1, LOOKBACK_BARS, LOB_DIM)
+        'priv':  _t(priv_seq),        # (1, LOOKBACK_BARS, PRIV_DIM)
         'macro': _t(macro_current),   # (1, 11)
     }
 

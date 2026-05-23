@@ -19,13 +19,13 @@ Implements the four core components of DeepScalper (CIKM '22, Sun et al.):
        Total: L = L_q + η × L_vol  (η = 1.0)
 
 Observation format (dict):
-    obs['lob']   → np.ndarray (seq_len, LOB_DIM=5)   micro features
+    obs['lob']   → np.ndarray (seq_len, LOB_DIM=4)   micro features
     obs['priv']  → np.ndarray (seq_len, PRIV_DIM=2)  private state (pos, pnl)
     obs['macro'] → np.ndarray (MACRO_DIM=11,)         current-bar macro features
 
 Actions:
-    dir_action  ∈ {0=HOLD, 1=BUY, 2=SELL}
-    size_action ∈ {0=25%, 1=50%, 2=75%, 3=100%}
+    dir_action  ∈ {0=FLAT, 1=LONG}
+    size_action ∈ {0}  (single size branch in V2)
 """
 
 import logging
@@ -234,10 +234,10 @@ class DeepScalperAgent:
 
     Args:
         macro_dim      : MACRO_DIM (11).
-        lob_dim        : LOB_DIM (5).
+        lob_dim        : LOB_DIM (4).
         priv_dim       : PRIV_DIM (2).
-        n_dir          : N_DIR (3) — direction branch action count.
-        n_size         : N_SIZE (4) — size branch action count.
+        n_dir          : N_DIR (2) — direction branch action count.
+        n_size         : N_SIZE (1) — size branch action count.
         gru_hidden     : GRU hidden units per stream.
         macro_embed    : MacroEncoder output dim.
         fc_hidden      : Width of FC layers in BDQ heads.
@@ -257,10 +257,10 @@ class DeepScalperAgent:
     def __init__(
         self,
         macro_dim:       int   = 11,
-        lob_dim:         int   = 5,
+        lob_dim:         int   = 4,
         priv_dim:        int   = 2,
-        n_dir:           int   = 3,
-        n_size:          int   = 4,
+        n_dir:           int   = 2,
+        n_size:          int   = 1,
         gru_hidden:      int   = 128,
         macro_embed:     int   = 64,
         fc_hidden:       int   = 128,
@@ -314,7 +314,7 @@ class DeepScalperAgent:
     def compute_hindsight_reward(
         self,
         base_reward:   float,
-        position:      int,    # +1 = long, -1 = short, 0 = flat
+        position:      int,    # 1 = long, 0 = flat
         current_price: float,
         future_price:  float,
     ) -> float:

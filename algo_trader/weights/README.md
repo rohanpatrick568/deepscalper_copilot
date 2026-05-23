@@ -1,68 +1,74 @@
 # weights/
 
-This directory contains pre-trained DeepScalper model weights — one `.pth` file per S&P 100 ticker.
+This directory contains V2 DeepScalper model weights for crypto trading.
 
-## Contents
+## Expected Files (V2)
 
-After a successful training run (Colab notebook `03_train_deepscalper.ipynb`) and weight export (`04_export_and_push_weights.ipynb`), this directory will contain 100 files:
+V2 uses a BTC/USD-only universe by default, so the expected primary file is:
 
 ```
-AAPL.pth
-MSFT.pth
-AMZN.pth
-... (one per S&P 100 ticker)
-CME.pth
+BTC_USD.pth
 ```
 
-## How to Pull Weights
+If the configured universe is expanded later, each pair should use the same naming pattern:
+
+```
+{PAIR_WITH_SLASH_REPLACED_BY_UNDERSCORE}.pth
+```
+
+Examples:
+
+```
+BTC_USD.pth
+ETH_USD.pth
+```
+
+## Verify Weights
 
 ```bash
-# Clone or update the repo (weights are tracked via Git LFS)
-git lfs install
-git pull origin main
-
-# Verify all 100 files are present
 python -c "
 from pathlib import Path
-from tickers import SP100_TICKERS
-missing = [t for t in SP100_TICKERS if not (Path('weights') / f'{t}.pth').exists()]
-print(f'Missing: {missing}' if missing else 'All 100 weight files present.')
+from config import CRYPTO_PAIRS
+missing = [p for p in CRYPTO_PAIRS if not (Path('weights') / f'{p.replace('/', '_')}.pth').exists()]
+print(f'Missing: {missing}' if missing else 'All crypto weight files present.')
 "
 ```
 
-## Git LFS Setup
-
-Weight files (`.pth`) are stored using [Git Large File Storage (LFS)](https://git-lfs.github.com/) to avoid bloating the main repository history.
-
-```bash
-# One-time setup
-git lfs install
-git lfs track "*.pth"
-git add .gitattributes
-git commit -m "track .pth files with Git LFS"
-```
-
-## File Naming Convention
-
-Each file is named `{TICKER}.pth` where `{TICKER}` matches exactly the symbol in `tickers.py` (e.g. `BRK.B.pth` for Berkshire Hathaway).
-
 ## Model Architecture
 
-Each `.pth` file contains the `state_dict` of a `DuelingQNetwork` (see `colab/deepscalper/architecture.py`) trained on 6 months of 1-minute OHLCV data for the corresponding ticker. The state dict is loaded with:
+Each `.pth` file contains a `state_dict` for `DeepScalperNet` trained with V2 dimensions:
+
+- `MACRO_DIM = 11`
+- `LOB_DIM = 4`
+- `N_DIR = 2` (FLAT/LONG)
+- `N_SIZE = 1`
+
+Load example:
 
 ```python
 import torch
-from colab.deepscalper.architecture import DuelingQNetwork
-from config import INPUT_DIM, ACTION_DIM, LOOKBACK_BARS, HIDDEN_SIZE, FC_SIZE, DROPOUT_RATE
+from colab.deepscalper.architecture import DeepScalperNet
+from config import MACRO_DIM, LOB_DIM, PRIV_DIM, GRU_HIDDEN, MACRO_EMBED_DIM, FC_HIDDEN, N_DIR, N_SIZE
 
-model = DuelingQNetwork(LOOKBACK_BARS, INPUT_DIM, ACTION_DIM, HIDDEN_SIZE, FC_SIZE, DROPOUT_RATE)
-model.load_state_dict(torch.load("weights/AAPL.pth", map_location="cpu"))
+model = DeepScalperNet(
+	macro_dim=MACRO_DIM,
+	lob_dim=LOB_DIM,
+	priv_dim=PRIV_DIM,
+	gru_hidden=GRU_HIDDEN,
+	macro_embed=MACRO_EMBED_DIM,
+	fc_hidden=FC_HIDDEN,
+	n_dir=N_DIR,
+	n_size=N_SIZE,
+)
+state = torch.load("weights/BTC_USD.pth", map_location="cpu")
+state_dict = state.get("online_net", state)
+model.load_state_dict(state_dict)
 model.eval()
 ```
 
-## Retraining
+## Retraining Pipeline
 
-To retrain all models from scratch, run the Colab notebooks in order:
+Run notebooks in order:
 
 1. `colab/01_fetch_training_data.ipynb`
 2. `colab/02_feature_engineering.ipynb`

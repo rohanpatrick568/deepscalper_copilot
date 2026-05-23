@@ -36,13 +36,13 @@ Four building blocks (Figure 3):
   Total loss: L = L_q + η × L_vol
 
 Observation split (must match environment.py / state_builder.py):
-  lob   : (B, seq_len, LOB_DIM=5)   — microstructure sequence
+    lob   : (B, seq_len, LOB_DIM=4)   — microstructure sequence
   priv  : (B, seq_len, PRIV_DIM=2)  — private-state sequence (position, P&L)
   macro : (B, MACRO_DIM=11)         — current-bar macro features (no time dim)
 
 Action space (BDQ):
-  direction : N_DIR=3    (0=HOLD, 1=BUY, 2=SELL)
-  size      : N_SIZE=4   (0=25%, 1=50%, 2=75%, 3=100%)
+    direction : N_DIR=2    (0=FLAT, 1=LONG)
+    size      : N_SIZE=1   (single size branch retained for interface compatibility)
 """
 
 import torch
@@ -50,10 +50,10 @@ import torch.nn as nn
 
 # Default dimension constants (kept in sync with config.py)
 _MACRO_DIM  = 11
-_LOB_DIM    = 5
+_LOB_DIM    = 4
 _PRIV_DIM   = 2
-_N_DIR      = 3
-_N_SIZE     = 4
+_N_DIR      = 2
+_N_SIZE     = 1
 _GRU_HIDDEN = 128
 _MACRO_EMB  = 64
 _FC_HIDDEN  = 128
@@ -73,7 +73,7 @@ class MicroEncoder(nn.Module):
     concatenated to form the micro-level embedding e^i_t.
 
     Args:
-        lob_dim    : Feature dim per timestep for the LOB stream (default 5).
+        lob_dim    : Feature dim per timestep for the LOB stream (default 4).
         priv_dim   : Feature dim per timestep for the private-state stream (default 2).
         gru_hidden : GRU hidden size for each stream (paper searches [32,64,128]).
     """
@@ -192,13 +192,13 @@ class DeepScalperNet(nn.Module):
 
     Args:
         macro_dim   : MACRO_DIM (11).
-        lob_dim     : LOB_DIM (5).
+        lob_dim     : LOB_DIM (4).
         priv_dim    : PRIV_DIM (2).
         gru_hidden  : GRU hidden size per stream.
         macro_embed : MacroEncoder output dimension.
         fc_hidden   : FC layer width in advantage / value heads.
-        n_dir       : Number of direction actions (N_DIR = 3).
-        n_size      : Number of size actions (N_SIZE = 4).
+        n_dir       : Number of direction actions (N_DIR = 2).
+        n_size      : Number of size actions (N_SIZE = 1).
     """
 
     def __init__(
@@ -317,7 +317,7 @@ class DeepScalperNet(nn.Module):
 class DuelingQNetwork(DeepScalperNet):
     """Deprecated — use DeepScalperNet.  Kept for backward compatibility."""
 
-    def __init__(self, lookback_bars=60, input_dim=11, action_dim=3,
+    def __init__(self, lookback_bars=60, input_dim=11, action_dim=2,
                  hidden_size=128, fc_size=128, dropout_rate=0.0, **kwargs):
         super().__init__(
             macro_dim=input_dim,
