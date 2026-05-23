@@ -1,4 +1,37 @@
-"""\ncolab/deepscalper/utils.py — Feature Engineering for DeepScalper (paper-faithful).\n\nImplements the exact feature sets described in the DeepScalper paper (CIKM '22):\n\n  compute_macro_features(bars_df) → ndarray (n, MACRO_DIM=11)\n      11 macro features from Table 2:\n        z_open, z_high, z_low, z_close, z_adj_close,\n        z_d_5, z_d_10, z_d_15, z_d_20, z_d_25, z_d_30\n\n  compute_micro_features(bars_df, lob_snapshots=None, use_proxy=True) → ndarray (n, LOB_DIM=4)\n      V2 CHANGE: Dual-mode (proxy for training, real LOB for inference).\n      4 microstructure features: spread_pct, order_imbalance, depth_ratio, mid_move_1min\n\n  compute_features(bars_df) → ndarray (n, 11)\n      Alias for compute_macro_features (backward compatibility).\n\n  compute_day_starts(index) → list[int]  # V2 CHANGE: UTC midnight boundaries (crypto 24/7)\n  _compute_time_features(index) → ndarray (n, 2)  # V2 CHANGE: UTC sin/cos hour encoding\n  compute_sharpe(rewards)   → float\n  compute_win_rate(rewards) → float\n"""\n\nimport logging\nfrom typing import List, Optional\n\nimport numpy as np\nimport pandas as pd\nimport pytz\n\nlogger = logging.getLogger(__name__)\n\n_ET = pytz.timezone("US/Eastern")\n
+"""
+colab/deepscalper/utils.py — Feature Engineering for DeepScalper (paper-faithful).
+
+Implements the exact feature sets described in the DeepScalper paper (CIKM '22):
+
+  compute_macro_features(bars_df) → ndarray (n, MACRO_DIM=11)
+      11 macro features from Table 2:
+        z_open, z_high, z_low, z_close, z_adj_close,
+        z_d_5, z_d_10, z_d_15, z_d_20, z_d_25, z_d_30
+
+  compute_micro_features(bars_df, lob_snapshots=None, use_proxy=True) → ndarray (n, LOB_DIM=4)
+      V2 CHANGE: Dual-mode (proxy for training, real LOB for inference).
+      4 microstructure features: spread_pct, order_imbalance, depth_ratio, mid_move_1min
+
+  compute_features(bars_df) → ndarray (n, 11)
+      Alias for compute_macro_features (backward compatibility).
+
+  compute_day_starts(index) → list[int]  # V2 CHANGE: UTC midnight boundaries (crypto 24/7)
+  _compute_time_features(index) → ndarray (n, 2)  # V2 CHANGE: UTC sin/cos hour encoding
+  compute_sharpe(rewards)   → float
+  compute_win_rate(rewards) → float
+"""
+
+import logging
+from typing import List, Optional
+
+import numpy as np
+import pandas as pd
+import pytz
+
+logger = logging.getLogger(__name__)
+
+_ET = pytz.timezone("US/Eastern")
+
 
 # ---------------------------------------------------------------------------
 # Macro features — Table 2 of the paper
