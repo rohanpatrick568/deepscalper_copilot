@@ -1,260 +1,297 @@
 """
-colab/deepscalper/environment.py — Custom Gym Environment for DeepScalper.
+colab/deepscalper/environment.py — DeepScalper Intraday Trading Environment.
 
-A gymnasium.Env subclass that simulates intraday trading on 1-minute OHLCV data.
+Faithful implementation of the trading environment described in:
+  "DeepScalper: A Risk-Aware Reinforcement Learning Framework to Capture
+   Fleeting Intraday Trading Opportunities"  (CIKM '22, Sun et al.)
 
-Episode semantics:
-  • One episode = one full trading day (up to 390 1-minute bars).
-  • Each reset() picks a random trading day from the training dataset.
-  • Observation: last LOOKBACK_BARS bars of normalised features.
-  • Action space: Discrete(3)  — 0=HOLD, 1=BUY, 2=SELL.
-  • Position tracking: flat (0) or long (+1).  No shorting supported.
-  • No-trade buffer: BUY/SELL actions during the first and last 15 minutes
-    are overridden to HOLD to match live circuit-breaker behaviour.
+Key paper-faithful design choices:
 
-Reward function:
-  • On HOLD or same-position actions: r = 0.
-  • On closing (SELL from long): r = log(exit_price / entry_price) − λ × 2.
+Observation Space (Dict):
+    'lob'   : Box(seq_len, LOB_DIM=5)    — micro sequence (LOB proxy)
+    'priv'  : Box(seq_len, PRIV_DIM=2)   — private state: (position_flag, unrealized_pnl%)
+    'macro' : Box(MACRO_DIM=11,)          — current bar macro features (Table 2)
+
+Action Space: MultiDiscrete([N_DIR=3, N_SIZE=4])
+    Direction : 0=HOLD  1=BUY  2=SELL
+    Size      : 0=25%   1=50%  2=75%   3=100%  (of max_notional)
+
+Reward:
+    r_t = log(P_{t+1} / P_t) × position (mark-to-market P&L)
+    Hindsight bonus (training only, applied in agent.store()):
+        r_H = r_t + w × log(P_{t+h} / P_t) × position   (Section 4.2)
+
+Vol target (info dict):
+    info['vol_target'] = std(z_close) over lookback window — for the
+    volatility auxiliary task (Section 4.4).
+
+Episode lifecycle:
+    • One episode = one full trading day (day-start to day-end).
+    • The environment cycles through pre-computed days randomly during training.
+    • Private state history is a deque of (position_flag, unrealized_pnl_pct)
+      maintained over the lookback window.
+
+Usage:
+    env = ScalperEnv(
+        lob_features   = lob_arr,     # (n_bars, 5)
+        macro_features = macro_arr,   # (n_bars, 11)
+        close_prices   = close_arr,   # (n_bars,)
+        day_starts     = [0, 390, …], # day boundary indices from compute_day_starts
+        lookback_bars  = 60,
+        max_notional   = 10_000.0,
+        transaction_cost_pct = 0.001,
+    )
+    obs, info = env.reset()
+    obs, reward, terminated, truncated, info = env.step(np.array([1, 2]))
 """
 
 import logging
-from typing import Any, Dict, Optional, Tuple
+import random
+from collections import deque
+from typing import Any, Dict, List, Optional, Tuple
 
 import gymnasium as gym
 import numpy as np
 from gymnasium import spaces
 
-from colab.deepscalper.utils import compute_features
-
 logger = logging.getLogger(__name__)
 
-# Action indices (must match agent.py and strategy.py)
-ACTION_HOLD = 0
-ACTION_BUY  = 1
-ACTION_SELL = 2
+# Size-branch → fraction of max_notional mapping
+_SIZE_FRACTIONS = [0.25, 0.50, 0.75, 1.00]
 
-_SESSION_MINUTES = 390           # Full regular session length
-_NO_TRADE_OPEN   = 15            # First 15 min: no trades
-_NO_TRADE_CLOSE  = 15            # Last 15 min: no trades
-_TRANSACTION_COST_LAMBDA = 0.0001
+# Action branch indices
+_HOLD = 0
+_BUY  = 1
+_SELL = 2
 
 
-class TradingEnv(gym.Env):
-    """Intraday trading environment for a single stock.
+class ScalperEnv(gym.Env):
+    """DeepScalper intraday trading environment.
 
     Args:
-        features: Numpy array of shape (total_bars, INPUT_DIM) containing
-                  pre-computed normalised features for every minute bar.
-        day_starts: List of indices into `features` where each trading day starts.
-        lookback_bars: Number of bars in the observation window (default 60).
-        transaction_cost_lambda: λ for the reward cost term.
-        seed: Random seed for reproducible episode selection.
-
-    Observation space:
-        Box of shape (lookback_bars, INPUT_DIM) — same as the network input.
-    Action space:
-        Discrete(3) — 0=HOLD, 1=BUY, 2=SELL.
+        lob_features          : Pre-computed LOB/micro features  (n_bars, LOB_DIM).
+        macro_features        : Pre-computed macro features       (n_bars, MACRO_DIM).
+        close_prices          : Raw close prices array            (n_bars,).
+        day_starts            : List of integer indices where each trading day begins.
+        lookback_bars         : Number of bars in the observation window (T in the paper).
+        max_notional          : Maximum position size in dollars.
+        transaction_cost_pct  : One-way transaction cost as fraction of trade value.
+        hindsight_horizon     : h — look-ahead bars for hindsight bonus (default 60).
+        n_dir                 : Direction branch actions  (default 3).
+        n_size                : Size branch actions       (default 4).
     """
 
     metadata = {"render_modes": []}
 
     def __init__(
         self,
-        features: np.ndarray,
-        day_starts: list,
-        lookback_bars: int = 60,
-        transaction_cost_lambda: float = _TRANSACTION_COST_LAMBDA,
-        seed: Optional[int] = None,
+        lob_features:         np.ndarray,
+        macro_features:       np.ndarray,
+        close_prices:         np.ndarray,
+        day_starts:           List[int],
+        lookback_bars:        int   = 60,
+        max_notional:         float = 10_000.0,
+        transaction_cost_pct: float = 0.001,
+        hindsight_horizon:    int   = 60,
+        n_dir:                int   = 3,
+        n_size:               int   = 4,
     ) -> None:
         super().__init__()
 
-        self._features = features.astype(np.float32)
-        self._day_starts = list(day_starts)
-        self._lookback = lookback_bars
-        self._lambda = transaction_cost_lambda
-        self._total_bars = len(features)
-        self._input_dim = features.shape[1]
+        self.lob_features   = np.asarray(lob_features,   dtype=np.float32)
+        self.macro_features = np.asarray(macro_features, dtype=np.float32)
+        self.close_prices   = np.asarray(close_prices,   dtype=np.float64)
 
-        # Spaces
-        self.observation_space = spaces.Box(
-            low=-np.inf,
-            high=np.inf,
-            shape=(lookback_bars, self._input_dim),
-            dtype=np.float32,
-        )
-        self.action_space = spaces.Discrete(3)
+        self.day_starts          = list(day_starts)
+        self.lookback_bars       = lookback_bars
+        self.max_notional        = max_notional
+        self.transaction_cost_pct = transaction_cost_pct
+        self.hindsight_horizon   = hindsight_horizon
 
-        # Internal state (reset on each episode)
-        self._current_step: int = 0
-        self._day_start_idx: int = 0
-        self._episode_end_idx: int = 0
-        self._position: int = 0        # 0=flat, 1=long
+        lob_dim   = self.lob_features.shape[1]
+        macro_dim = self.macro_features.shape[1]
+        priv_dim  = 2  # (position_flag, unrealized_pnl_pct)
+
+        # ----------------------------------------------------------------
+        # Observation space
+        # ----------------------------------------------------------------
+        self.observation_space = spaces.Dict({
+            'lob':   spaces.Box(-np.inf, np.inf, shape=(lookback_bars, lob_dim),   dtype=np.float32),
+            'priv':  spaces.Box(-np.inf, np.inf, shape=(lookback_bars, priv_dim),  dtype=np.float32),
+            'macro': spaces.Box(-np.inf, np.inf, shape=(macro_dim,),               dtype=np.float32),
+        })
+
+        # Action space: MultiDiscrete([n_dir, n_size])
+        self.action_space = spaces.MultiDiscrete([n_dir, n_size])
+
+        # Episode state (reset in reset())
+        self._day_idx:     int   = 0
+        self._t:           int   = 0
+        self._day_end:     int   = 0
+        self._position:    int   = 0      # +1 long, -1 short, 0 flat
         self._entry_price: float = 0.0
-        self._daily_pnl: float = 0.0
-
-        # Price column index in features matrix (feature 0 = return; price is implicit)
-        # We need raw close prices for reward computation — store separately
-        self._episode_prices: Optional[np.ndarray] = None
-
-        if seed is not None:
-            np.random.seed(seed)
-            self.action_space.seed(seed)
+        self._priv_history: deque = deque(maxlen=lookback_bars)
 
     # ------------------------------------------------------------------
-    # Gym interface
+    # Reset
     # ------------------------------------------------------------------
 
     def reset(
-        self,
-        seed: Optional[int] = None,
-        options: Optional[Dict] = None,
-    ) -> Tuple[np.ndarray, Dict]:
-        """Start a new episode by selecting a random training day.
+        self, *, seed: Optional[int] = None, options: Optional[Dict] = None
+    ) -> Tuple[Dict[str, np.ndarray], Dict]:
+        super().reset(seed=seed)
+        self._day_idx = random.randrange(len(self.day_starts))
+        self._t = self.day_starts[self._day_idx]
+        if self._day_idx + 1 < len(self.day_starts):
+            self._day_end = self.day_starts[self._day_idx + 1] - 1
+        else:
+            self._day_end = len(self.close_prices) - 1
 
-        Returns:
-            Tuple of (observation, info_dict).
-        """
-        if seed is not None:
-            np.random.seed(seed)
+        # Ensure we have at least lookback_bars + 1 bars for a step
+        if self._day_end - self._t < self.lookback_bars + 1:
+            return self.reset(seed=seed, options=options)
 
-        # Pick a random day that has enough bars for at least one full window
-        valid_days = [
-            d for d in self._day_starts
-            if d + self._lookback < self._total_bars
-        ]
-        if not valid_days:
-            raise RuntimeError("No valid training days found in dataset.")
-
-        self._day_start_idx = np.random.choice(valid_days)
-
-        # Episode covers up to 390 bars from day start (or end of dataset)
-        self._episode_end_idx = min(
-            self._day_start_idx + _SESSION_MINUTES,
-            self._total_bars - 1,
-        )
-        # Start step at lookback so first obs is fully filled
-        self._current_step = self._day_start_idx + self._lookback
-
-        # Reset position and P&L
-        self._position = 0
+        self._position    = 0
         self._entry_price = 0.0
-        self._daily_pnl = 0.0
+        self._priv_history = deque(
+            [np.zeros(2, dtype=np.float32)] * self.lookback_bars,
+            maxlen=self.lookback_bars,
+        )
+
+        # Advance t to lookback_bars so we have a full window
+        self._t = self.day_starts[self._day_idx] + self.lookback_bars - 1
 
         obs = self._get_obs()
-        info = self._get_info(0.0)
-        return obs, info
+        return obs, {}
 
-    def step(self, action: int) -> Tuple[np.ndarray, float, bool, bool, Dict]:
-        """Execute one environment step.
+    # ------------------------------------------------------------------
+    # Step
+    # ------------------------------------------------------------------
+
+    def step(
+        self, action: np.ndarray
+    ) -> Tuple[Dict[str, np.ndarray], float, bool, bool, Dict[str, Any]]:
+        """Execute one bar step.
 
         Args:
-            action: Action integer — 0=HOLD, 1=BUY, 2=SELL.
+            action : np.ndarray of shape (2,) — [dir_action, size_action].
 
         Returns:
-            Tuple of (observation, reward, terminated, truncated, info).
+            obs, reward, terminated, truncated, info
         """
-        # Enforce no-trade buffers — override BUY/SELL with HOLD
-        minute_in_session = self._current_step - self._day_start_idx
-        if minute_in_session < _NO_TRADE_OPEN or \
-                minute_in_session >= _SESSION_MINUTES - _NO_TRADE_CLOSE:
-            action = ACTION_HOLD
+        dir_action  = int(action[0])
+        size_action = int(action[1])
+        fraction    = _SIZE_FRACTIONS[size_action]
 
-        reward = 0.0
+        current_price = float(self.close_prices[self._t])
+        next_t        = self._t + 1
+        next_price    = float(self.close_prices[min(next_t, self._day_end)])
 
-        # Approximate current close price via cumulative return reconstruction
-        # Feature index 0 is the bar return; we reconstruct price relative to 100
-        current_price = self._reconstruct_price(self._current_step)
+        cost = 0.0
+        prev_position = self._position
 
-        if action == ACTION_BUY and self._position == 0:
-            # Open long position
-            self._position = 1
+        # ---- Execute action ----
+        if dir_action == _BUY and self._position <= 0:
+            if self._position < 0:
+                # Close short
+                pnl = (self._entry_price - current_price) / (self._entry_price + 1e-10)
+                cost += self.transaction_cost_pct
+            self._position    = 1
             self._entry_price = current_price
+            cost += self.transaction_cost_pct
 
-        elif action == ACTION_SELL and self._position == 1:
-            # Close long position and compute reward
-            reward = self._compute_reward(current_price)
-            self._daily_pnl += reward
-            self._position = 0
-            self._entry_price = 0.0
+        elif dir_action == _SELL and self._position >= 0:
+            if self._position > 0:
+                # Close long
+                pnl = (current_price - self._entry_price) / (self._entry_price + 1e-10)
+                cost += self.transaction_cost_pct
+            self._position    = -1
+            self._entry_price = current_price
+            cost += self.transaction_cost_pct
 
-        # Force-close any open position at EOD
-        self._current_step += 1
-        terminated = self._current_step >= self._episode_end_idx
+        # HOLD: keep current position unchanged
 
-        if terminated and self._position == 1:
-            eod_price = self._reconstruct_price(self._current_step - 1)
-            reward += self._compute_reward(eod_price)
-            self._position = 0
+        # ---- Compute step reward (log return × position) ----
+        if self._position != 0 and current_price > 0:
+            log_ret = float(np.log(next_price / current_price))
+            reward  = log_ret * self._position - cost
+        else:
+            reward = -cost
+
+        # ---- Unrealized P&L for private state ----
+        if self._position != 0 and self._entry_price > 0:
+            unreal_pnl = (
+                (current_price - self._entry_price) / self._entry_price * self._position
+            )
+        else:
+            unreal_pnl = 0.0
+
+        # ---- Update private state history ----
+        pos_flag = 1.0 if self._position != 0 else 0.0
+        self._priv_history.append(
+            np.array([pos_flag, float(np.clip(unreal_pnl, -0.5, 0.5))], dtype=np.float32)
+        )
+
+        # ---- Advance time ----
+        self._t = next_t
+        terminated = self._t >= self._day_end
+
+        # ---- Volatility target for auxiliary task ----
+        # std of z_close over lookback window (macro feature index 3)
+        win_start  = max(0, self._t - self.lookback_bars)
+        win_end    = self._t
+        z_close_win = self.macro_features[win_start:win_end, 3]  # z_close
+        vol_target  = float(z_close_win.std()) if len(z_close_win) > 1 else 0.0
+
+        # ---- Hindsight future price (stored in info for agent to use) ----
+        h_idx = min(self._t + self.hindsight_horizon, self._day_end)
+        future_price = float(self.close_prices[h_idx])
+
+        info = {
+            'vol_target':    vol_target,
+            'current_price': current_price,
+            'future_price':  future_price,
+            'position':      prev_position,
+            'dir_action':    dir_action,
+            'size_action':   size_action,
+        }
 
         obs = self._get_obs()
-        info = self._get_info(current_price)
+        return obs, reward, terminated, False, info
 
-        return obs, float(reward), terminated, False, info
+    # ------------------------------------------------------------------
+    # Observation assembly
+    # ------------------------------------------------------------------
+
+    def _get_obs(self) -> Dict[str, np.ndarray]:
+        """Assemble the current observation dict."""
+        t = self._t
+        win_start = max(0, t - self.lookback_bars + 1)
+        win_end   = t + 1
+
+        lob_seq  = self.lob_features[win_start:win_end]
+        # Pad at the front if we don't yet have a full window
+        if lob_seq.shape[0] < self.lookback_bars:
+            pad = np.zeros(
+                (self.lookback_bars - lob_seq.shape[0], lob_seq.shape[1]), dtype=np.float32
+            )
+            lob_seq = np.vstack([pad, lob_seq])
+
+        priv_arr = np.array(list(self._priv_history), dtype=np.float32)  # (seq, 2)
+        macro    = self.macro_features[t]  # (macro_dim,)
+
+        return {
+            'lob':   lob_seq.astype(np.float32),
+            'priv':  priv_arr.astype(np.float32),
+            'macro': macro.astype(np.float32),
+        }
+
+    # ------------------------------------------------------------------
+    # Rendering (not required for training)
+    # ------------------------------------------------------------------
 
     def render(self) -> None:
-        """Rendering is not supported in this environment."""
         pass
 
-    # ------------------------------------------------------------------
-    # Internal helpers
-    # ------------------------------------------------------------------
-
-    def _get_obs(self) -> np.ndarray:
-        """Extract the (lookback_bars, input_dim) observation window."""
-        start = max(0, self._current_step - self._lookback)
-        end = self._current_step
-        window = self._features[start:end]
-
-        # Pad with zeros if we're at the beginning of data
-        if len(window) < self._lookback:
-            pad = np.zeros((self._lookback - len(window), self._input_dim), dtype=np.float32)
-            window = np.vstack([pad, window])
-
-        return window.astype(np.float32)
-
-    def _reconstruct_price(self, step_idx: int) -> float:
-        """Approximate price by exponentiating cumulative returns.
-
-        Feature column 0 is the bar return (close_{t}/close_{t-1} - 1).
-        We reconstruct price relative to an arbitrary base of 100.
-
-        Args:
-            step_idx: Absolute index into self._features.
-
-        Returns:
-            Reconstructed price float.
-        """
-        day_returns = self._features[self._day_start_idx:step_idx + 1, 0]
-        price = 100.0 * np.prod(1.0 + day_returns.clip(-0.1, 0.1))
-        return float(price)
-
-    def _compute_reward(self, exit_price: float) -> float:
-        """Compute log-return reward minus round-trip transaction cost.
-
-        Args:
-            exit_price: Price at which the long position is closed.
-
-        Returns:
-            Reward scalar.
-        """
-        if self._entry_price <= 0:
-            return 0.0
-        log_ret = np.log(exit_price / (self._entry_price + 1e-10))
-        cost = self._lambda * 2   # 10 bps per side × 2 (round-trip)
-        return float(log_ret - cost)
-
-    def _get_info(self, price: float) -> Dict[str, Any]:
-        """Build the info dict returned alongside each step.
-
-        Args:
-            price: Approximate current price.
-
-        Returns:
-            Dict with keys: price, position, daily_pnl, minute_in_session.
-        """
-        return {
-            "price": price,
-            "position": self._position,
-            "daily_pnl": self._daily_pnl,
-            "minute_in_session": self._current_step - self._day_start_idx,
-        }
+    def close(self) -> None:
+        pass

@@ -1,26 +1,37 @@
 """
-colab/deepscalper/agent.py — DeepScalper RL Agent.
+colab/deepscalper/agent.py — DeepScalper RL Agent (1:1 paper replica).
 
-Implements:
-  • Double DQN update rule with soft-updating target network (τ = 0.01).
-  • Prioritized Experience Replay (PER) with SumTree — O(log N) sampling.
-  • ε-greedy exploration with linear decay over EPSILON_DECAY_STEPS steps.
-  • Adam optimiser with cosine annealing learning rate schedule.
-  • Gradient clipping (max_norm = 1.0).
-  • Reward function: r = log(P_close / P_entry) − λ × transaction_cost
+Implements the four core components of DeepScalper (CIKM '22, Sun et al.):
 
-Usage (inside training notebook):
-    agent = DeepScalperAgent(lookback_bars=60, input_dim=11, action_dim=3)
-    action = agent.select_action(state)
-    agent.store(state, action, reward, next_state, done)
-    loss = agent.learn()
-    agent.save("AAPL.pth")
+  1. Branching DQN (BDQ) with per-branch Double-DQN targets
+       L_q = (1/|D|) Σ_d Σ_b w_b (y_d - Q_d(s_b, a_d_b))²
+       where d ∈ {direction, size}, w_b = IS weights from PER
+
+  2. Hindsight bonus reward (Section 4.2)
+       r_H = r_t + w × log(P_{t+h} / P_t) × position
+       Applied at store() time; w=0.01, h=60.
+
+  3. Prioritized Experience Replay (PER) with SumTree (O(log N) ops)
+       Stores dict observations + separate vol_target for the auxiliary task.
+
+  4. Volatility auxiliary task (Section 4.4)
+       L_vol = MSE(vol_head(e_t), realized_vol_target)
+       Total: L = L_q + η × L_vol  (η = 1.0)
+
+Observation format (dict):
+    obs['lob']   → np.ndarray (seq_len, LOB_DIM=5)   micro features
+    obs['priv']  → np.ndarray (seq_len, PRIV_DIM=2)  private state (pos, pnl)
+    obs['macro'] → np.ndarray (MACRO_DIM=11,)         current-bar macro features
+
+Actions:
+    dir_action  ∈ {0=HOLD, 1=BUY, 2=SELL}
+    size_action ∈ {0=25%, 1=50%, 2=75%, 3=100%}
 """
 
 import logging
 import random
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import Dict, Optional, Tuple
 
 import numpy as np
 import torch
@@ -28,37 +39,32 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 
-from colab.deepscalper.architecture import DuelingQNetwork
+from colab.deepscalper.architecture import DeepScalperNet
 
 logger = logging.getLogger(__name__)
-
 
 # ---------------------------------------------------------------------------
 # Prioritized Experience Replay — SumTree
 # ---------------------------------------------------------------------------
 
 class _SumTree:
-    """Binary SumTree for O(log N) prioritized sampling.
-
-    Args:
-        capacity: Maximum number of transitions stored.
-    """
+    """Binary SumTree for O(log N) priority sampling."""
 
     def __init__(self, capacity: int) -> None:
         self.capacity = capacity
-        self.tree = np.zeros(2 * capacity - 1, dtype=np.float64)
-        self.data: list = [None] * capacity
-        self.write_ptr: int = 0
-        self.n_entries: int = 0
+        self.tree     = np.zeros(2 * capacity - 1, dtype=np.float64)
+        self.data     = np.empty(capacity, dtype=object)
+        self.write    = 0
+        self.n_entries = 0
 
-    def _propagate(self, idx: int, delta: float) -> None:
+    def _propagate(self, idx: int, change: float) -> None:
         parent = (idx - 1) // 2
-        self.tree[parent] += delta
+        self.tree[parent] += change
         if parent != 0:
-            self._propagate(parent, delta)
+            self._propagate(parent, change)
 
     def _retrieve(self, idx: int, s: float) -> int:
-        left = 2 * idx + 1
+        left  = 2 * idx + 1
         right = left + 1
         if left >= len(self.tree):
             return idx
@@ -71,120 +77,152 @@ class _SumTree:
         return float(self.tree[0])
 
     def add(self, priority: float, data) -> None:
-        """Insert a new experience with the given priority."""
-        leaf_idx = self.write_ptr + self.capacity - 1
-        self.data[self.write_ptr] = data
-        self.update(leaf_idx, priority)
-        self.write_ptr = (self.write_ptr + 1) % self.capacity
+        idx = self.write + self.capacity - 1
+        self.data[self.write] = data
+        self.update(idx, priority)
+        self.write = (self.write + 1) % self.capacity
         self.n_entries = min(self.n_entries + 1, self.capacity)
 
-    def update(self, leaf_idx: int, priority: float) -> None:
-        """Update the priority of an existing leaf node."""
-        delta = priority - self.tree[leaf_idx]
-        self.tree[leaf_idx] = priority
-        self._propagate(leaf_idx, delta)
+    def update(self, idx: int, priority: float) -> None:
+        change = priority - self.tree[idx]
+        self.tree[idx] = priority
+        self._propagate(idx, change)
 
-    def sample(self, s: float) -> Tuple[int, float, object]:
-        """Sample a leaf by traversing the tree for cumulative sum s.
+    def get(self, s: float) -> Tuple[int, float, object]:
+        idx  = self._retrieve(0, s)
+        data_idx = idx - self.capacity + 1
+        return idx, float(self.tree[idx]), self.data[data_idx]
 
-        Returns:
-            Tuple of (leaf_idx, priority, data).
-        """
-        leaf_idx = self._retrieve(0, s)
-        data_idx = leaf_idx - self.capacity + 1
-        return leaf_idx, self.tree[leaf_idx], self.data[data_idx]
 
+# ---------------------------------------------------------------------------
+# Prioritized Replay Buffer
+# ---------------------------------------------------------------------------
 
 class PrioritizedReplayBuffer:
-    """Prioritized Experience Replay buffer backed by a SumTree.
+    """PER buffer that stores dict observations and the vol_target.
+
+    Each transition stores:
+        (obs_dict, dir_action, size_action, reward, next_obs_dict, done, vol_target)
 
     Args:
-        capacity: Maximum number of stored transitions.
-        alpha: Priority exponent — how strongly priorities affect sampling.
-        beta_start: Initial IS weight exponent (annealed → 1.0 during training).
+        capacity    : Maximum number of transitions.
+        alpha       : Priority exponent (0=uniform, 1=full PER).
+        beta_start  : IS-weight correction exponent start value.
+        beta_frames : Number of frames over which β is annealed to 1.0.
+        epsilon     : Small constant to ensure non-zero priority.
     """
 
-    _EPSILON: float = 1e-6    # Minimum priority to avoid zero-probability sampling
+    def __init__(
+        self,
+        capacity:    int   = 100_000,
+        alpha:       float = 0.6,
+        beta_start:  float = 0.4,
+        beta_frames: int   = 100_000,
+        epsilon:     float = 1e-6,
+    ) -> None:
+        self.tree        = _SumTree(capacity)
+        self.capacity    = capacity
+        self.alpha       = alpha
+        self.beta_start  = beta_start
+        self.beta_frames = beta_frames
+        self.epsilon     = epsilon
+        self.frame       = 1
+        self.max_prio    = 1.0
 
-    def __init__(self, capacity: int, alpha: float = 0.6, beta_start: float = 0.4) -> None:
-        self._tree = _SumTree(capacity)
-        self._alpha = alpha
-        self._beta = beta_start
-        self._max_priority: float = 1.0
+    @property
+    def beta(self) -> float:
+        return min(1.0, self.beta_start + self.frame * (1.0 - self.beta_start) / self.beta_frames)
 
-    def push(self, state, action, reward, next_state, done) -> None:
-        """Add a new transition with maximum priority (ensures it's sampled at least once).
+    def push(
+        self,
+        obs:        Dict[str, np.ndarray],
+        dir_action: int,
+        size_action: int,
+        reward:     float,
+        next_obs:   Dict[str, np.ndarray],
+        done:       bool,
+        vol_target: float,
+    ) -> None:
+        """Store a transition with maximum current priority."""
+        data = (obs, dir_action, size_action, reward, next_obs, done, vol_target)
+        self.tree.add(self.max_prio ** self.alpha, data)
 
-        Args:
-            state: Current state tensor/array.
-            action: Action taken (integer).
-            reward: Reward received (float).
-            next_state: Next state tensor/array.
-            done: Episode termination flag (bool).
-        """
-        priority = self._max_priority ** self._alpha
-        self._tree.add(priority, (state, action, reward, next_state, done))
-
-    def sample(self, batch_size: int) -> Tuple:
-        """Sample a batch of transitions using priority-weighted probabilities.
-
-        Args:
-            batch_size: Number of transitions to sample.
+    def sample(self, batch_size: int, device: str = "cpu"):
+        """Sample a batch of transitions proportional to priority.
 
         Returns:
-            Tuple of (states, actions, rewards, next_states, dones,
-                      importance_weights, leaf_indices)
+            Tuple of (batch tensors, indices, IS weights).
         """
-        total = self._tree.total
-        segment = total / batch_size
+        n = self.tree.n_entries
+        indices   = np.zeros(batch_size, dtype=np.int64)
+        weights   = np.zeros(batch_size, dtype=np.float32)
+        segment   = self.tree.total / batch_size
+        min_prob  = (self.tree.tree[self.tree.capacity - 1] / self.tree.total + 1e-10)
 
-        leaf_indices, priorities, samples = [], [], []
+        obs_lob   = []
+        obs_priv  = []
+        obs_macro = []
+        dir_acts  = []
+        size_acts = []
+        rewards   = []
+        nob_lob   = []
+        nob_priv  = []
+        nob_macro = []
+        dones     = []
+        vol_tgts  = []
+
+        beta = self.beta
+        self.frame += 1
+
         for i in range(batch_size):
-            lo, hi = segment * i, segment * (i + 1)
-            s = random.uniform(lo, hi)
-            s = min(s, total - self._EPSILON)
-            idx, priority, data = self._tree.sample(s)
-            leaf_indices.append(idx)
-            priorities.append(priority)
-            samples.append(data)
+            s = random.uniform(segment * i, segment * (i + 1))
+            idx, prio, data = self.tree.get(s)
+            prob = prio / self.tree.total
+            weights[i] = ((1.0 / (n * max(prob, 1e-10))) ** beta)
+            indices[i] = idx
 
-        # Compute importance-sampling weights
-        probs = np.array(priorities) / (total + self._EPSILON)
-        is_weights = (self._tree.n_entries * probs) ** (-self._beta)
-        is_weights /= is_weights.max()   # Normalise so max weight = 1
+            obs, d_act, s_act, rew, nobs, dn, v_tgt = data
+            obs_lob.append(obs['lob'])
+            obs_priv.append(obs['priv'])
+            obs_macro.append(obs['macro'])
+            dir_acts.append(d_act)
+            size_acts.append(s_act)
+            rewards.append(rew)
+            nob_lob.append(nobs['lob'])
+            nob_priv.append(nobs['priv'])
+            nob_macro.append(nobs['macro'])
+            dones.append(float(dn))
+            vol_tgts.append(v_tgt)
 
-        states      = np.array([s[0] for s in samples], dtype=np.float32)
-        actions     = np.array([s[1] for s in samples], dtype=np.int64)
-        rewards     = np.array([s[2] for s in samples], dtype=np.float32)
-        next_states = np.array([s[3] for s in samples], dtype=np.float32)
-        dones       = np.array([s[4] for s in samples], dtype=np.float32)
+        weights /= weights.max()
 
-        return states, actions, rewards, next_states, dones, is_weights.astype(np.float32), leaf_indices
+        def _t(arr, dtype=torch.float32):
+            return torch.tensor(np.array(arr), dtype=dtype, device=device)
 
-    def update_priorities(self, leaf_indices: list, td_errors: np.ndarray) -> None:
-        """Update priorities for sampled transitions after learning.
+        batch = {
+            'lob':        _t(obs_lob),
+            'priv':       _t(obs_priv),
+            'macro':      _t(obs_macro),
+            'dir_acts':   _t(dir_acts, torch.long),
+            'size_acts':  _t(size_acts, torch.long),
+            'rewards':    _t(rewards),
+            'next_lob':   _t(nob_lob),
+            'next_priv':  _t(nob_priv),
+            'next_macro': _t(nob_macro),
+            'dones':      _t(dones),
+            'vol_tgts':   _t(vol_tgts),
+            'weights':    _t(weights),
+        }
+        return batch, indices, weights
 
-        Args:
-            leaf_indices: Leaf indices returned by sample().
-            td_errors: Absolute TD errors for the corresponding transitions.
-        """
-        for idx, err in zip(leaf_indices, td_errors):
-            priority = (abs(err) + self._EPSILON) ** self._alpha
-            self._tree.update(idx, priority)
-            self._max_priority = max(self._max_priority, priority)
-
-    def anneal_beta(self, step: int, total_steps: int) -> None:
-        """Linearly anneal beta from beta_start → 1.0.
-
-        Args:
-            step: Current training step.
-            total_steps: Total expected training steps.
-        """
-        fraction = min(1.0, step / total_steps)
-        self._beta = 0.4 + fraction * 0.6   # 0.4 → 1.0
+    def update_priorities(self, indices: np.ndarray, priorities: np.ndarray) -> None:
+        for idx, prio in zip(indices, priorities):
+            p = (float(prio) + self.epsilon) ** self.alpha
+            self.tree.update(int(idx), p)
+            self.max_prio = max(self.max_prio, p)
 
     def __len__(self) -> int:
-        return self._tree.n_entries
+        return self.tree.n_entries
 
 
 # ---------------------------------------------------------------------------
@@ -192,108 +230,109 @@ class PrioritizedReplayBuffer:
 # ---------------------------------------------------------------------------
 
 class DeepScalperAgent:
-    """Full DeepScalper RL Agent with Double DQN + PER.
+    """DeepScalper RL agent — BDQ + PER + hindsight bonus + vol auxiliary task.
 
     Args:
-        lookback_bars: Sequence length fed to the network.
-        input_dim: Feature count per bar.
-        action_dim: Number of discrete actions (3).
-        hidden_size: LSTM hidden state size.
-        fc_size: First FC width in dueling head.
-        dropout_rate: Dropout probability.
-        lr: Adam learning rate.
-        gamma: Discount factor.
-        batch_size: Minibatch size for each learning step.
+        macro_dim      : MACRO_DIM (11).
+        lob_dim        : LOB_DIM (5).
+        priv_dim       : PRIV_DIM (2).
+        n_dir          : N_DIR (3) — direction branch action count.
+        n_size         : N_SIZE (4) — size branch action count.
+        gru_hidden     : GRU hidden units per stream.
+        macro_embed    : MacroEncoder output dim.
+        fc_hidden      : Width of FC layers in BDQ heads.
+        lr             : Adam learning rate.
+        gamma          : Reward discount factor.
+        tau            : Soft target-network update rate.
+        batch_size     : Training mini-batch size.
         buffer_capacity: PER buffer capacity.
-        target_update_freq: Steps between soft-target updates.
-        tau: Soft-update coefficient (target ← τ·online + (1−τ)·target).
-        epsilon_start: Initial exploration rate.
-        epsilon_end: Final (minimum) exploration rate.
-        epsilon_decay_steps: Steps over which ε decays linearly.
-        per_alpha: PER priority exponent.
-        per_beta_start: PER IS-weight annealing start.
-        transaction_cost_lambda: Cost coefficient in reward function.
-        device: PyTorch device string.
+        epsilon_start  : Initial exploration rate.
+        epsilon_end    : Minimum exploration rate.
+        epsilon_decay  : Steps over which ε is linearly decayed.
+        aux_eta        : Weight for the volatility auxiliary loss (η).
+        hindsight_w    : Hindsight bonus weight (w).
+        device         : 'cuda' or 'cpu'.
     """
 
     def __init__(
         self,
-        lookback_bars: int,
-        input_dim: int,
-        action_dim: int = 3,
-        hidden_size: int = 128,
-        fc_size: int = 256,
-        dropout_rate: float = 0.2,
-        lr: float = 3e-4,
-        gamma: float = 0.99,
-        batch_size: int = 64,
-        buffer_capacity: int = 50_000,
-        target_update_freq: int = 100,
-        tau: float = 0.01,
-        epsilon_start: float = 1.0,
-        epsilon_end: float = 0.01,
-        epsilon_decay_steps: int = 10_000,
-        per_alpha: float = 0.6,
-        per_beta_start: float = 0.4,
-        transaction_cost_lambda: float = 0.0001,
-        device: str = "cuda" if torch.cuda.is_available() else "cpu",
+        macro_dim:       int   = 11,
+        lob_dim:         int   = 5,
+        priv_dim:        int   = 2,
+        n_dir:           int   = 3,
+        n_size:          int   = 4,
+        gru_hidden:      int   = 128,
+        macro_embed:     int   = 64,
+        fc_hidden:       int   = 128,
+        lr:              float = 1e-4,
+        gamma:           float = 0.99,
+        tau:             float = 0.01,
+        batch_size:      int   = 64,
+        buffer_capacity: int   = 100_000,
+        epsilon_start:   float = 1.0,
+        epsilon_end:     float = 0.05,
+        epsilon_decay:   int   = 50_000,
+        aux_eta:         float = 1.0,
+        hindsight_w:     float = 0.01,
+        device:          str   = "cpu",
     ) -> None:
+        self.n_dir         = n_dir
+        self.n_size        = n_size
+        self.gamma         = gamma
+        self.tau           = tau
+        self.batch_size    = batch_size
+        self.aux_eta       = aux_eta
+        self.hindsight_w   = hindsight_w
+        self.device        = device
+        self.epsilon       = epsilon_start
+        self.epsilon_end   = epsilon_end
+        self.epsilon_decay = epsilon_decay
+        self._steps        = 0
 
-        self.action_dim = action_dim
-        self.gamma = gamma
-        self.batch_size = batch_size
-        self.target_update_freq = target_update_freq
-        self.tau = tau
-        self.epsilon = epsilon_start
-        self.epsilon_end = epsilon_end
-        self.epsilon_decay = (epsilon_start - epsilon_end) / epsilon_decay_steps
-        self.transaction_cost_lambda = transaction_cost_lambda
-        self.device = torch.device(device)
-
-        # Online network (trained with gradient descent)
-        self.online_net = DuelingQNetwork(
-            lookback_bars, input_dim, action_dim, hidden_size, fc_size, dropout_rate
-        ).to(self.device)
-
-        # Target network (periodically synced via soft-update)
-        self.target_net = DuelingQNetwork(
-            lookback_bars, input_dim, action_dim, hidden_size, fc_size, dropout_rate
-        ).to(self.device)
+        net_kwargs = dict(
+            macro_dim=macro_dim,
+            lob_dim=lob_dim,
+            priv_dim=priv_dim,
+            gru_hidden=gru_hidden,
+            macro_embed=macro_embed,
+            fc_hidden=fc_hidden,
+            n_dir=n_dir,
+            n_size=n_size,
+        )
+        self.online_net = DeepScalperNet(**net_kwargs).to(device)
+        self.target_net = DeepScalperNet(**net_kwargs).to(device)
         self.target_net.load_state_dict(self.online_net.state_dict())
         self.target_net.eval()
 
-        # Optimiser + LR scheduler
         self.optimizer = optim.Adam(self.online_net.parameters(), lr=lr)
-        self.scheduler = optim.lr_scheduler.CosineAnnealingLR(
-            self.optimizer, T_max=10_000, eta_min=lr * 0.1
-        )
-
-        # Prioritized replay buffer
-        self.memory = PrioritizedReplayBuffer(buffer_capacity, per_alpha, per_beta_start)
-
-        self._step_count: int = 0
+        self.buffer = PrioritizedReplayBuffer(capacity=buffer_capacity)
 
     # ------------------------------------------------------------------
-    # Action selection
+    # Hindsight bonus reward — Section 4.2
     # ------------------------------------------------------------------
 
-    def select_action(self, state: np.ndarray, eval_mode: bool = False) -> int:
-        """ε-greedy action selection.
+    def compute_hindsight_reward(
+        self,
+        base_reward:   float,
+        position:      int,    # +1 = long, -1 = short, 0 = flat
+        current_price: float,
+        future_price:  float,
+    ) -> float:
+        """Add hindsight bonus: r_H = r_t + w × log(P_{t+h}/P_t) × position.
 
         Args:
-            state: Numpy array of shape (lookback_bars, input_dim).
-            eval_mode: If True, always returns the greedy action (ε = 0).
+            base_reward   : The environment's step reward r_t.
+            position      : Current position flag (+1/0/-1).
+            current_price : P_t — price at current bar.
+            future_price  : P_{t+h} — price h bars ahead (from environment).
 
         Returns:
-            Action index in {0, 1, 2}.
+            Augmented reward with hindsight bonus.
         """
-        if not eval_mode and random.random() < self.epsilon:
-            return random.randint(0, self.action_dim - 1)
-
-        state_t = torch.from_numpy(state).unsqueeze(0).float().to(self.device)
-        with torch.no_grad():
-            q_values = self.online_net(state_t)
-        return int(q_values.argmax(dim=1).item())
+        if position == 0 or future_price <= 0 or current_price <= 0:
+            return base_reward
+        bonus = self.hindsight_w * float(np.log(future_price / current_price)) * position
+        return base_reward + bonus
 
     # ------------------------------------------------------------------
     # Experience storage
@@ -301,147 +340,154 @@ class DeepScalperAgent:
 
     def store(
         self,
-        state: np.ndarray,
-        action: int,
-        reward: float,
-        next_state: np.ndarray,
-        done: bool,
+        obs:        Dict[str, np.ndarray],
+        dir_action: int,
+        size_action: int,
+        reward:     float,
+        next_obs:   Dict[str, np.ndarray],
+        done:       bool,
+        vol_target: float,
     ) -> None:
-        """Store a transition in the replay buffer.
-
-        Args:
-            state: Current state array (lookback_bars, input_dim).
-            action: Action taken.
-            reward: Reward received.
-            next_state: Next state array.
-            done: True if the episode ended on this step.
-        """
-        self.memory.push(state, action, reward, next_state, done)
+        """Push one transition into the replay buffer."""
+        self.buffer.push(obs, dir_action, size_action, reward, next_obs, done, vol_target)
 
     # ------------------------------------------------------------------
-    # Learning step
+    # Action selection
+    # ------------------------------------------------------------------
+
+    def select_action(
+        self,
+        obs: Dict[str, np.ndarray],
+    ) -> Tuple[int, int]:
+        """ε-greedy action selection.
+
+        Args:
+            obs : Dict with keys 'lob' (seq,5), 'priv' (seq,2), 'macro' (11,).
+
+        Returns:
+            (dir_action, size_action) — integer indices for each branch.
+        """
+        # Linear ε decay
+        self.epsilon = max(
+            self.epsilon_end,
+            self.epsilon - (1.0 - self.epsilon_end) / self.epsilon_decay,
+        )
+        self._steps += 1
+
+        if random.random() < self.epsilon:
+            return random.randrange(self.n_dir), random.randrange(self.n_size)
+
+        self.online_net.eval()
+        with torch.no_grad():
+            lob   = torch.tensor(obs['lob'][None],   dtype=torch.float32, device=self.device)
+            priv  = torch.tensor(obs['priv'][None],  dtype=torch.float32, device=self.device)
+            macro = torch.tensor(obs['macro'][None],  dtype=torch.float32, device=self.device)
+            q_dir, q_size, _ = self.online_net(lob, priv, macro)
+        self.online_net.train()
+        return int(q_dir.argmax(1).item()), int(q_size.argmax(1).item())
+
+    # ------------------------------------------------------------------
+    # Training step — BDQ Double-DQN + PER + aux loss
     # ------------------------------------------------------------------
 
     def learn(self) -> Optional[float]:
-        """Sample a batch from PER and perform one gradient update.
+        """Sample from buffer, compute BDQ + vol loss, and update online net.
 
         Returns:
-            Mean batch loss as a Python float, or None if the buffer is
-            too small to form a full batch.
+            Total loss as a float, or None if buffer is too small.
         """
-        if len(self.memory) < self.batch_size:
+        if len(self.buffer) < self.batch_size:
             return None
 
-        self._step_count += 1
-        self.memory.anneal_beta(self._step_count, total_steps=50_000)
+        batch, indices, _ = self.buffer.sample(self.batch_size, device=self.device)
 
-        # Sample batch
-        states, actions, rewards, next_states, dones, is_weights, leaf_idxs = \
-            self.memory.sample(self.batch_size)
+        lob   = batch['lob']
+        priv  = batch['priv']
+        macro = batch['macro']
+        nlob  = batch['next_lob']
+        npriv = batch['next_priv']
+        nmacro = batch['next_macro']
 
-        # Convert to tensors
-        s  = torch.from_numpy(states).float().to(self.device)
-        a  = torch.from_numpy(actions).long().to(self.device)
-        r  = torch.from_numpy(rewards).float().to(self.device)
-        ns = torch.from_numpy(next_states).float().to(self.device)
-        d  = torch.from_numpy(dones).float().to(self.device)
-        w  = torch.from_numpy(is_weights).float().to(self.device)
+        dir_acts  = batch['dir_acts']    # (B,)
+        size_acts = batch['size_acts']   # (B,)
+        rewards   = batch['rewards']     # (B,)
+        dones     = batch['dones']       # (B,)
+        vol_tgts  = batch['vol_tgts']    # (B,)
+        is_weights = batch['weights']    # (B,) IS correction
 
-        # Current Q-values from online network
-        q_current = self.online_net(s).gather(1, a.unsqueeze(1)).squeeze(1)
+        # -- Online network forward --
+        q_dir, q_size, vol_pred = self.online_net(lob, priv, macro)
 
-        # Double DQN: online selects action, target evaluates it
+        # -- Double-DQN targets: select action with online net, eval with target --
         with torch.no_grad():
-            next_actions = self.online_net(ns).argmax(dim=1, keepdim=True)
-            q_next = self.target_net(ns).gather(1, next_actions).squeeze(1)
-            q_target = r + self.gamma * q_next * (1.0 - d)
+            # online net picks best next-action for each branch
+            nq_dir_online, nq_size_online, _ = self.online_net(nlob, npriv, nmacro)
+            next_dir_acts  = nq_dir_online.argmax(1)
+            next_size_acts = nq_size_online.argmax(1)
 
-        # TD errors for PER priority updates
-        td_errors = (q_current.detach() - q_target.detach()).abs().cpu().numpy()
-        self.memory.update_priorities(leaf_idxs, td_errors)
+            # target net evaluates those actions
+            nq_dir_target, nq_size_target, _ = self.target_net(nlob, npriv, nmacro)
+            next_q_dir  = nq_dir_target.gather(1,  next_dir_acts.unsqueeze(1)).squeeze(1)
+            next_q_size = nq_size_target.gather(1, next_size_acts.unsqueeze(1)).squeeze(1)
 
-        # Weighted Huber loss
-        loss_elementwise = F.smooth_l1_loss(q_current, q_target, reduction="none")
-        loss = (loss_elementwise * w).mean()
+            y_dir  = rewards + self.gamma * next_q_dir  * (1.0 - dones)
+            y_size = rewards + self.gamma * next_q_size * (1.0 - dones)
 
-        # Gradient update
+        # -- BDQ Q-loss (both branches, IS-weighted) --
+        q_dir_a  = q_dir.gather(1,  dir_acts.unsqueeze(1)).squeeze(1)
+        q_size_a = q_size.gather(1, size_acts.unsqueeze(1)).squeeze(1)
+
+        td_dir  = (y_dir  - q_dir_a).pow(2)
+        td_size = (y_size - q_size_a).pow(2)
+        l_q = (is_weights * (td_dir + td_size) / 2.0).mean()
+
+        # -- Volatility auxiliary loss (Section 4.4) --
+        vol_pred_flat = vol_pred.squeeze(1)
+        l_vol = F.mse_loss(vol_pred_flat, vol_tgts)
+
+        loss = l_q + self.aux_eta * l_vol
+
+        # -- Backprop --
         self.optimizer.zero_grad()
         loss.backward()
         nn.utils.clip_grad_norm_(self.online_net.parameters(), max_norm=1.0)
         self.optimizer.step()
-        self.scheduler.step()
 
-        # ε decay
-        self.epsilon = max(self.epsilon_end, self.epsilon - self.epsilon_decay)
+        # -- Update PER priorities --
+        td_errors = ((td_dir + td_size) / 2.0).detach().cpu().numpy()
+        self.buffer.update_priorities(indices, td_errors + 1e-6)
 
-        # Soft-update target network
-        if self._step_count % self.target_update_freq == 0:
-            self._soft_update()
-
-        return float(loss.item())
-
-    def _soft_update(self) -> None:
-        """Soft-update target network: θ_target ← τ·θ_online + (1−τ)·θ_target."""
+        # -- Soft target update --
         for online_p, target_p in zip(
             self.online_net.parameters(), self.target_net.parameters()
         ):
-            target_p.data.copy_(
-                self.tau * online_p.data + (1.0 - self.tau) * target_p.data
-            )
+            target_p.data.copy_(self.tau * online_p.data + (1.0 - self.tau) * target_p.data)
 
-    # ------------------------------------------------------------------
-    # Reward computation
-    # ------------------------------------------------------------------
-
-    @staticmethod
-    def compute_reward(
-        entry_price: float,
-        exit_price: float,
-        held: bool,
-        transaction_cost_lambda: float = 0.0001,
-    ) -> float:
-        """Compute the DeepScalper reward for a completed trade.
-
-        Reward = log(P_exit / P_entry) − λ × transaction_cost
-        where transaction_cost = 2 (one round-trip = entry + exit).
-
-        Args:
-            entry_price: Price at position open.
-            exit_price: Price at position close.
-            held: True if the agent held a position (incurs transaction cost).
-            transaction_cost_lambda: λ coefficient for transaction cost.
-
-        Returns:
-            Scalar reward value.
-        """
-        if not held or entry_price <= 0:
-            return 0.0
-        log_return = np.log(exit_price / (entry_price + 1e-10))
-        cost = transaction_cost_lambda * 2   # Round-trip cost
-        return float(log_return - cost)
+        return float(loss.item())
 
     # ------------------------------------------------------------------
     # Persistence
     # ------------------------------------------------------------------
 
     def save(self, path: str) -> None:
-        """Save the online network's state_dict to disk.
-
-        Args:
-            path: File path for the .pth weight file.
-        """
-        torch.save(self.online_net.state_dict(), path)
-        logger.info("Saved model weights → %s", path)
+        """Save model weights + agent meta to disk."""
+        p = Path(path)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        torch.save({
+            "online_net": self.online_net.state_dict(),
+            "target_net": self.target_net.state_dict(),
+            "optimizer":  self.optimizer.state_dict(),
+            "epsilon":    self.epsilon,
+            "steps":      self._steps,
+        }, str(p))
+        logger.info("Saved agent to %s", path)
 
     def load(self, path: str) -> None:
-        """Load weights into the online network from a .pth file.
-
-        Args:
-            path: File path to the .pth weight file.
-        """
-        state_dict = torch.load(path, map_location=self.device, weights_only=True)
-        self.online_net.load_state_dict(state_dict)
-        self.target_net.load_state_dict(state_dict)
-        self.online_net.eval()
-        self.target_net.eval()
-        logger.info("Loaded model weights ← %s", path)
+        """Load model weights + agent meta from disk."""
+        ckpt = torch.load(path, map_location=self.device, weights_only=True)
+        self.online_net.load_state_dict(ckpt["online_net"])
+        self.target_net.load_state_dict(ckpt["target_net"])
+        self.optimizer.load_state_dict(ckpt["optimizer"])
+        self.epsilon = ckpt.get("epsilon", self.epsilon_end)
+        self._steps  = ckpt.get("steps",   0)
+        logger.info("Loaded agent from %s", path)

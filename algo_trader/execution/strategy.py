@@ -25,14 +25,17 @@ import torch
 import torch.nn.functional as F
 
 from config import (
-    ACTION_DIM,
+    N_DIR,
+    N_SIZE,
+    GRU_HIDDEN,
+    MACRO_EMBED_DIM,
+    FC_HIDDEN,
+    MACRO_DIM,
+    LOB_DIM,
+    PRIV_DIM,
     ATR_PERIOD,
     CLOSE_ALL_EOD,
-    DROPOUT_RATE,
     EOD_CLOSE_BUFFER_MIN,
-    FC_SIZE,
-    HIDDEN_SIZE,
-    INPUT_DIM,
     KELLY_FRACTION,
     LOOKBACK_BARS,
     MARKET_CLOSE_HOUR,
@@ -53,14 +56,14 @@ from dashboard.data_bridge import (
 )
 from execution.circuit_breakers import CircuitBreaker
 from execution.risk import calculate_atr_stop, kelly_position_size
-from execution.state_builder import build_state_tensor
+from execution.state_builder import build_observation
 
 # Import architecture — add colab directory to sys.path if needed
 _COLAB_PATH = Path(__file__).parent.parent / "colab"
 if str(_COLAB_PATH) not in sys.path:
     sys.path.insert(0, str(_COLAB_PATH))
 
-from deepscalper.architecture import DuelingQNetwork  # noqa: E402
+from deepscalper.architecture import DeepScalperNet  # noqa: E402
 
 from lumibot.entities import Asset
 from lumibot.strategies import Strategy
@@ -97,7 +100,7 @@ class MultiStockDeepScalper(Strategy):
     def __init__(self, data_bridge: DataBridge, **kwargs) -> None:
         super().__init__(**kwargs)
         self._data_bridge: DataBridge = data_bridge
-        self._models: Dict[str, DuelingQNetwork] = {}
+        self._models: Dict[str, DeepScalperNet] = {}
         self._circuit_breaker: Optional[CircuitBreaker] = None
 
         # Per-ticker win/loss tracking for Kelly sizing
@@ -260,7 +263,7 @@ class MultiStockDeepScalper(Strategy):
     # ------------------------------------------------------------------
 
     def _load_models(self) -> None:
-        """Load all DuelingQNetwork weights from WEIGHTS_DIR into self._models."""
+        """Load all DeepScalperNet weights from WEIGHTS_DIR into self._models."""
         weights_path = Path(WEIGHTS_DIR)
         loaded = 0
         missing = []
@@ -271,16 +274,20 @@ class MultiStockDeepScalper(Strategy):
                 missing.append(ticker)
                 continue
 
-            model = DuelingQNetwork(
-                lookback_bars=LOOKBACK_BARS,
-                input_dim=INPUT_DIM,
-                action_dim=ACTION_DIM,
-                hidden_size=HIDDEN_SIZE,
-                fc_size=FC_SIZE,
-                dropout_rate=DROPOUT_RATE,
+            model = DeepScalperNet(
+                macro_dim=MACRO_DIM,
+                lob_dim=LOB_DIM,
+                priv_dim=PRIV_DIM,
+                gru_hidden=GRU_HIDDEN,
+                macro_embed=MACRO_EMBED_DIM,
+                fc_hidden=FC_HIDDEN,
+                n_dir=N_DIR,
+                n_size=N_SIZE,
             )
             try:
-                state_dict = torch.load(str(pth_file), map_location="cpu")
+                ckpt = torch.load(str(pth_file), map_location="cpu", weights_only=True)
+                # Support both raw state_dict and agent checkpoint
+                state_dict = ckpt.get("online_net", ckpt)
                 model.load_state_dict(state_dict)
                 model.eval()
                 self._models[ticker] = model
@@ -333,17 +340,28 @@ class MultiStockDeepScalper(Strategy):
             )
             return
 
-        # Build state tensor
-        state = build_state_tensor(bars)
-        if state is None:
-            return
+        # Determine current position flag and unrealized P&L for private state
+        pos_obj = current_positions.get(ticker)
+        position_flag = 0
+        unrealized_pnl_pct = 0.0
+        if pos_obj is not None and pos_obj.quantity != 0:
+            position_flag = 1 if pos_obj.quantity > 0 else -1
+            entry = self._entry_prices.get(ticker, 0.0)
+            last_price = self._get_last_price(ticker) or 0.0
+            if entry > 0 and last_price > 0:
+                unrealized_pnl_pct = (last_price - entry) / entry * position_flag
 
-        # Run model inference (no_grad prevents gradient accumulation)
+        # Build dict observation
+        obs = build_observation(bars, position=position_flag, unrealized_pnl_pct=unrealized_pnl_pct)
+
+        # Run BDQ inference (no_grad prevents gradient accumulation)
         model = self._models[ticker]
         with torch.no_grad():
-            q_values = model(state)  # shape (1, ACTION_DIM)
+            q_dir, q_size, _ = model(
+                obs['lob'], obs['priv'], obs['macro']
+            )  # q_dir: (1, N_DIR), q_size: (1, N_SIZE)
 
-        q_np = q_values.squeeze(0).cpu().numpy()  # shape (ACTION_DIM,)
+        q_np = q_dir.squeeze(0).cpu().numpy()  # (N_DIR,) — use direction branch
         action = int(q_np.argmax())
         confidence = float(F.softmax(torch.from_numpy(q_np), dim=0).max())
 

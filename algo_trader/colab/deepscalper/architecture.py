@@ -1,172 +1,330 @@
 """
-colab/deepscalper/architecture.py — DeepScalper Dueling Q-Network.
+colab/deepscalper/architecture.py — DeepScalper Network (1:1 paper replica).
 
-Implements the DuelingQNetwork with:
-  • 2-layer LSTM encoder (hidden_size=128) for temporal sequence processing.
-    LSTM was chosen over CNN because it naturally captures long-range
-    temporal dependencies in 1-minute bar sequences without requiring
-    manual kernel tuning for different time scales.
-  • Temporal attention layer that learns to weight recent bars more heavily.
-  • LayerNorm applied to the LSTM output for training stability.
-  • Dueling head: separate Value stream V(s) and Advantage stream A(s,a).
-  • Output: Q(s,a) = V(s) + A(s,a) − mean(A(s,a))
+Implements the full architecture from:
+  "DeepScalper: A Risk-Aware Reinforcement Learning Framework to Capture
+   Fleeting Intraday Trading Opportunities"  (CIKM '22, Sun et al.)
 
-Input shape:  (batch_size, LOOKBACK_BARS, INPUT_DIM)  e.g. (64, 60, 11)
-Output shape: (batch_size, ACTION_DIM)                 e.g. (64, 3)
+Four building blocks (Figure 3):
+
+  (a) MicroEncoder    — Two-stream GRU over LOB sequence + private-state sequence.
+                        LOB stream  : GRU(lob_dim,  gru_hidden) → last hidden h_lob
+                        Priv stream : GRU(priv_dim, gru_hidden) → last hidden h_priv
+                        micro_embed = concat(h_lob, h_priv)   shape (B, 2*gru_hidden)
+
+  (b) MacroEncoder    — Single MLP over current-bar OHLCV + technical indicators.
+                        Input  : (B, MACRO_DIM)  — z_open…z_d_30 (Table 2)
+                        Output : (B, macro_embed)
+
+  Market embedding    = concat(micro_embed, macro_embed)        shape (B, embed_dim)
+
+  (c) BranchingDuelingQNetwork (BDQ) — Figure 3(d)
+        Value head    : FC → V(s)                                shape (B, 1)
+        Dir advantage : FC → A_dir(s, a_dir)                     shape (B, N_DIR)
+        Size advantage: FC → A_size(s, a_size)                   shape (B, N_SIZE)
+        Q_dir  = V + A_dir  − mean(A_dir)
+        Q_size = V + A_size − mean(A_size)
+
+      During inference : a_dir  = argmax Q_dir,  a_size = argmax Q_size
+      BDQ loss         : (1/2) Σ_{d∈{dir,size}} E[(y_d − Q_d)²]   (IS-weighted)
+
+  (d) VolatilityHead  — Single Linear layer for the risk-aware auxiliary task.
+                        Input  : market_embedding
+                        Output : predicted realised volatility  shape (B, 1)
+                        Loss   : L_vol = (y_vol − ŷ_vol)²
+
+  Total loss: L = L_q + η × L_vol
+
+Observation split (must match environment.py / state_builder.py):
+  lob   : (B, seq_len, LOB_DIM=5)   — microstructure sequence
+  priv  : (B, seq_len, PRIV_DIM=2)  — private-state sequence (position, P&L)
+  macro : (B, MACRO_DIM=11)         — current-bar macro features (no time dim)
+
+Action space (BDQ):
+  direction : N_DIR=3    (0=HOLD, 1=BUY, 2=SELL)
+  size      : N_SIZE=4   (0=25%, 1=50%, 2=75%, 3=100%)
 """
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
+
+# Default dimension constants (kept in sync with config.py)
+_MACRO_DIM  = 11
+_LOB_DIM    = 5
+_PRIV_DIM   = 2
+_N_DIR      = 3
+_N_SIZE     = 4
+_GRU_HIDDEN = 128
+_MACRO_EMB  = 64
+_FC_HIDDEN  = 128
 
 
-class TemporalAttention(nn.Module):
-    """Learnable additive attention over the LSTM output sequence.
+# ---------------------------------------------------------------------------
+# (a) Micro-level encoder — Figure 3(a)
+# ---------------------------------------------------------------------------
 
-    Produces a context vector by computing a weighted sum of all hidden states,
-    where the weights are learned via a single linear projection + softmax.
+class MicroEncoder(nn.Module):
+    """Two-stream GRU encoder for micro-level market information.
 
-    Args:
-        hidden_size: Dimensionality of each LSTM hidden state.
-    """
+    Stream 1 (LOB)  : encodes the intrabar microstructure (LOB proxy) sequence.
+    Stream 2 (Priv) : encodes the trader's private-state sequence.
 
-    def __init__(self, hidden_size: int) -> None:
-        super().__init__()
-        # Projects each hidden state to a scalar score
-        self.score_proj = nn.Linear(hidden_size, 1, bias=False)
-
-    def forward(self, lstm_out: torch.Tensor) -> torch.Tensor:
-        """Compute the attended context vector.
-
-        Args:
-            lstm_out: Tensor of shape (batch, seq_len, hidden_size) —
-                      output from all LSTM time-steps.
-
-        Returns:
-            Context tensor of shape (batch, hidden_size).
-        """
-        # scores: (batch, seq_len, 1)
-        scores = self.score_proj(lstm_out)
-        # weights: (batch, seq_len, 1)  — softmax over the time dimension
-        weights = F.softmax(scores, dim=1)
-        # context: (batch, hidden_size)  — weighted sum over time-steps
-        context = (weights * lstm_out).sum(dim=1)
-        return context
-
-
-class DuelingQNetwork(nn.Module):
-    """DeepScalper Dueling Q-Network with Temporal Attention.
-
-    Architecture overview:
-        Input → 2-layer LSTM → LayerNorm → TemporalAttention
-              ├─→ Value stream:     FC(256) → ReLU → Dropout → FC(128) → ReLU → Dropout → FC(1)
-              └─→ Advantage stream: FC(256) → ReLU → Dropout → FC(128) → ReLU → Dropout → FC(ACTION_DIM)
-        Output: Q(s,a) = V(s) + A(s,a) − mean(A(s,a))
+    Both streams produce one GRU layer each.  The last hidden states are
+    concatenated to form the micro-level embedding e^i_t.
 
     Args:
-        lookback_bars: Sequence length (number of 1-min bars in state).
-        input_dim: Number of features per bar (INPUT_DIM).
-        action_dim: Number of discrete actions (ACTION_DIM = 3).
-        hidden_size: LSTM hidden state size.
-        fc_size: Width of the first FC layer in each dueling stream.
-        dropout_rate: Dropout probability applied after each FC activation.
+        lob_dim    : Feature dim per timestep for the LOB stream (default 5).
+        priv_dim   : Feature dim per timestep for the private-state stream (default 2).
+        gru_hidden : GRU hidden size for each stream (paper searches [32,64,128]).
     """
 
     def __init__(
         self,
-        lookback_bars: int,
-        input_dim: int,
-        action_dim: int,
-        hidden_size: int = 128,
-        fc_size: int = 256,
-        dropout_rate: float = 0.2,
+        lob_dim:    int = _LOB_DIM,
+        priv_dim:   int = _PRIV_DIM,
+        gru_hidden: int = _GRU_HIDDEN,
+    ) -> None:
+        super().__init__()
+        self.gru_lob  = nn.GRU(lob_dim,  gru_hidden, num_layers=1, batch_first=True)
+        self.gru_priv = nn.GRU(priv_dim, gru_hidden, num_layers=1, batch_first=True)
+
+    def forward(self, lob: torch.Tensor, priv: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            lob  : (batch, seq_len, lob_dim)
+            priv : (batch, seq_len, priv_dim)
+        Returns:
+            Micro embedding of shape (batch, 2 * gru_hidden).
+        """
+        _, h_lob  = self.gru_lob(lob)    # h_lob:  (1, batch, gru_hidden)
+        _, h_priv = self.gru_priv(priv)  # h_priv: (1, batch, gru_hidden)
+        return torch.cat([h_lob.squeeze(0), h_priv.squeeze(0)], dim=-1)
+
+
+# ---------------------------------------------------------------------------
+# (b) Macro-level encoder — Figure 3(b)
+# ---------------------------------------------------------------------------
+
+class MacroEncoder(nn.Module):
+    """MLP encoder for macro-level market information.
+
+    Takes the current bar's OHLCV-derived + moving-average feature vector
+    (no recurrence needed — temporal history is already encoded via the
+    z_d_5…z_d_30 moving-average spread features).
+
+    Architecture: Linear(macro_dim, hidden) → ReLU → Linear(hidden, embed_dim) → ReLU
+
+    Args:
+        macro_dim : Number of macro features (MACRO_DIM = 11).
+        hidden    : MLP hidden layer width (paper searches [32,64,128]).
+        embed_dim : Output embedding dimension.
+    """
+
+    def __init__(
+        self,
+        macro_dim: int = _MACRO_DIM,
+        hidden:    int = _FC_HIDDEN,
+        embed_dim: int = _MACRO_EMB,
+    ) -> None:
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(macro_dim, hidden),
+            nn.ReLU(inplace=True),
+            nn.Linear(hidden, embed_dim),
+            nn.ReLU(inplace=True),
+        )
+
+    def forward(self, macro: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            macro : (batch, macro_dim)
+        Returns:
+            Macro embedding of shape (batch, embed_dim).
+        """
+        return self.net(macro)
+
+
+# ---------------------------------------------------------------------------
+# (c) Risk-aware auxiliary task — Section 4.4
+# ---------------------------------------------------------------------------
+
+class VolatilityHead(nn.Module):
+    """Single-layer MLP for volatility prediction (risk-aware auxiliary task).
+
+    Predicts the realised return standard-deviation over the observation window.
+    Only active during training; not used at inference time.
+
+    Args:
+        embed_dim : Dimensionality of the market embedding.
+    """
+
+    def __init__(self, embed_dim: int) -> None:
+        super().__init__()
+        self.fc = nn.Linear(embed_dim, 1)
+
+    def forward(self, e: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            e : Market embedding (batch, embed_dim).
+        Returns:
+            Predicted volatility (batch, 1).
+        """
+        return self.fc(e)
+
+
+# ---------------------------------------------------------------------------
+# Full DeepScalper network: BDQ + VolHead
+# ---------------------------------------------------------------------------
+
+class DeepScalperNet(nn.Module):
+    """DeepScalper complete network (BDQ + Volatility head).
+
+    Combines the macro and micro encoders into a market embedding, then
+    branches into:
+      - Shared value head  V(s)
+      - Direction advantage head  A_dir(s, a_dir)
+      - Size advantage head       A_size(s, a_size)
+      - Volatility prediction head (auxiliary training signal)
+
+    Q-value computation (standard dueling aggregation per branch):
+        Q_dir  = V(s) + A_dir(s,a)  − mean_{a'} A_dir(s,a')
+        Q_size = V(s) + A_size(s,a) − mean_{a'} A_size(s,a')
+
+    Args:
+        macro_dim   : MACRO_DIM (11).
+        lob_dim     : LOB_DIM (5).
+        priv_dim    : PRIV_DIM (2).
+        gru_hidden  : GRU hidden size per stream.
+        macro_embed : MacroEncoder output dimension.
+        fc_hidden   : FC layer width in advantage / value heads.
+        n_dir       : Number of direction actions (N_DIR = 3).
+        n_size      : Number of size actions (N_SIZE = 4).
+    """
+
+    def __init__(
+        self,
+        macro_dim:   int = _MACRO_DIM,
+        lob_dim:     int = _LOB_DIM,
+        priv_dim:    int = _PRIV_DIM,
+        gru_hidden:  int = _GRU_HIDDEN,
+        macro_embed: int = _MACRO_EMB,
+        fc_hidden:   int = _FC_HIDDEN,
+        n_dir:       int = _N_DIR,
+        n_size:      int = _N_SIZE,
     ) -> None:
         super().__init__()
 
-        self.lookback_bars = lookback_bars
-        self.input_dim = input_dim
-        self.action_dim = action_dim
-        self.hidden_size = hidden_size
+        self.n_dir  = n_dir
+        self.n_size = n_size
 
-        # ----------------------------------------------------------------
-        # Encoder: 2-layer LSTM
-        # dropout inside LSTM only applies between layers (not after last)
-        # ----------------------------------------------------------------
-        self.lstm = nn.LSTM(
-            input_size=input_dim,
-            hidden_size=hidden_size,
-            num_layers=2,
-            batch_first=True,
-            dropout=dropout_rate,   # Applied between LSTM layers
+        self.micro_enc = MicroEncoder(lob_dim, priv_dim, gru_hidden)
+        self.macro_enc = MacroEncoder(macro_dim, fc_hidden, macro_embed)
+
+        # Total market embedding dimension
+        embed_dim = 2 * gru_hidden + macro_embed
+
+        # Shared value stream  V(s)
+        self.value_head = nn.Sequential(
+            nn.Linear(embed_dim, fc_hidden),
+            nn.ReLU(inplace=True),
+            nn.Linear(fc_hidden, 1),
         )
 
-        # LayerNorm applied over the feature dimension of LSTM outputs
-        self.layer_norm = nn.LayerNorm(hidden_size)
-
-        # Temporal attention: collapses (batch, seq_len, hidden) → (batch, hidden)
-        self.attention = TemporalAttention(hidden_size)
-
-        # ----------------------------------------------------------------
-        # Value stream: V(s) — scalar estimate of state value
-        # ----------------------------------------------------------------
-        self.value_stream = nn.Sequential(
-            nn.Linear(hidden_size, fc_size),
+        # Direction advantage stream  A_dir(s, a_dir)
+        self.adv_dir = nn.Sequential(
+            nn.Linear(embed_dim, fc_hidden),
             nn.ReLU(inplace=True),
-            nn.Dropout(dropout_rate),
-            nn.Linear(fc_size, fc_size // 2),
-            nn.ReLU(inplace=True),
-            nn.Dropout(dropout_rate),
-            nn.Linear(fc_size // 2, 1),
+            nn.Linear(fc_hidden, n_dir),
         )
 
-        # ----------------------------------------------------------------
-        # Advantage stream: A(s, a) — relative advantage of each action
-        # ----------------------------------------------------------------
-        self.advantage_stream = nn.Sequential(
-            nn.Linear(hidden_size, fc_size),
+        # Size advantage stream  A_size(s, a_size)
+        self.adv_size = nn.Sequential(
+            nn.Linear(embed_dim, fc_hidden),
             nn.ReLU(inplace=True),
-            nn.Dropout(dropout_rate),
-            nn.Linear(fc_size, fc_size // 2),
-            nn.ReLU(inplace=True),
-            nn.Dropout(dropout_rate),
-            nn.Linear(fc_size // 2, action_dim),
+            nn.Linear(fc_hidden, n_size),
         )
 
-        # Initialise weights for stable early training
+        # Volatility prediction head (auxiliary task)
+        self.vol_head = VolatilityHead(embed_dim)
+
         self._init_weights()
 
     def _init_weights(self) -> None:
-        """Apply Xavier uniform init to all linear layers."""
-        for module in self.modules():
-            if isinstance(module, nn.Linear):
-                nn.init.xavier_uniform_(module.weight)
-                if module.bias is not None:
-                    nn.init.zeros_(module.bias)
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Compute Q-values for each action given the input state sequence.
+    def embed(
+        self,
+        lob:   torch.Tensor,
+        priv:  torch.Tensor,
+        macro: torch.Tensor,
+    ) -> torch.Tensor:
+        """Compute the full market embedding from the three observation streams.
 
         Args:
-            x: Input tensor of shape (batch_size, lookback_bars, input_dim).
+            lob   : (batch, seq_len, lob_dim)
+            priv  : (batch, seq_len, priv_dim)
+            macro : (batch, macro_dim)
+        Returns:
+            Market embedding of shape (batch, embed_dim).
+        """
+        e_micro = self.micro_enc(lob, priv)   # (batch, 2*gru_hidden)
+        e_macro = self.macro_enc(macro)        # (batch, macro_embed)
+        return torch.cat([e_micro, e_macro], dim=-1)
+
+    def forward(
+        self,
+        lob:   torch.Tensor,
+        priv:  torch.Tensor,
+        macro: torch.Tensor,
+    ):
+        """Forward pass.
+
+        Args:
+            lob   : (batch, seq_len, lob_dim)
+            priv  : (batch, seq_len, priv_dim)
+            macro : (batch, macro_dim)
 
         Returns:
-            Q-value tensor of shape (batch_size, action_dim).
+            q_dir  : (batch, n_dir)   — Q-values for each direction action
+            q_size : (batch, n_size)  — Q-values for each size action
+            vol    : (batch, 1)       — predicted realised volatility
         """
-        # LSTM encoding — lstm_out: (batch, seq_len, hidden_size)
-        lstm_out, _ = self.lstm(x)
+        e = self.embed(lob, priv, macro)   # (batch, embed_dim)
 
-        # LayerNorm for training stability
-        lstm_out = self.layer_norm(lstm_out)
+        value  = self.value_head(e)        # (batch, 1)
+        a_dir  = self.adv_dir(e)           # (batch, n_dir)
+        a_size = self.adv_size(e)          # (batch, n_size)
 
-        # Temporal attention — context: (batch, hidden_size)
-        context = self.attention(lstm_out)
+        # Dueling combination (per branch)
+        q_dir  = value + (a_dir  - a_dir.mean(dim=1,  keepdim=True))
+        q_size = value + (a_size - a_size.mean(dim=1, keepdim=True))
 
-        # Dueling streams
-        value = self.value_stream(context)           # (batch, 1)
-        advantage = self.advantage_stream(context)   # (batch, action_dim)
+        vol = self.vol_head(e)             # (batch, 1)
 
-        # Dueling combination formula: Q = V + (A − mean(A))
-        # Subtracting the mean advantage stabilises learning by removing the
-        # identifiability problem between V and A.
-        q_values = value + (advantage - advantage.mean(dim=1, keepdim=True))
-        return q_values
+        return q_dir, q_size, vol
+
+
+# ---------------------------------------------------------------------------
+# Backward-compatibility shim
+# ---------------------------------------------------------------------------
+
+# The old class name is kept so that any existing checkpoints or imports
+# don't break immediately; it simply instantiates DeepScalperNet.
+class DuelingQNetwork(DeepScalperNet):
+    """Deprecated — use DeepScalperNet.  Kept for backward compatibility."""
+
+    def __init__(self, lookback_bars=60, input_dim=11, action_dim=3,
+                 hidden_size=128, fc_size=128, dropout_rate=0.0, **kwargs):
+        super().__init__(
+            macro_dim=input_dim,
+            fc_hidden=fc_size,
+            gru_hidden=hidden_size,
+            n_dir=action_dim,
+        )
+
+
+

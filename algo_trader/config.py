@@ -64,16 +64,41 @@ MARKET_CLOSE_MINUTE: int = 0
 MARKET_TIMEZONE: str = "US/Eastern"
 
 # ---------------------------------------------------------------------------
-# Model Architecture
+# Model Architecture  (DeepScalper paper — CIKM '22, Sun et al.)
 # ---------------------------------------------------------------------------
 WEIGHTS_DIR: Path = Path("./weights/")   # Local directory containing .pth weight files
-INPUT_DIM: int = 11                       # Feature count per bar (state vector depth)
-ACTION_DIM: int = 3                       # 0 = HOLD, 1 = BUY, 2 = SELL
-HIDDEN_SIZE: int = 128                    # LSTM hidden state size
-FC_SIZE: int = 256                        # First FC layer width in dueling head
-DROPOUT_RATE: float = 0.2                 # Dropout probability on FC layers
 
-# Training hyperparameters (reference values — used in Colab notebooks)
+# --- Observation dimensions ---
+MACRO_DIM: int = 11    # Macro features: z_open/high/low/close/adj + z_d_5..30 (Table 2)
+LOB_DIM: int = 5       # Micro/intrabar features (LOB proxy — no real LOB available)
+PRIV_DIM: int = 2      # Private state: (position_flag, unrealised_pnl_pct)
+
+# Legacy alias kept for backward compatibility
+INPUT_DIM: int = MACRO_DIM  # = 11
+
+# --- Action space (Branching Dueling Q-Network) ---
+N_DIR: int = 3         # Direction branch: 0=HOLD, 1=BUY, 2=SELL
+N_SIZE: int = 4        # Size branch: 0=25%, 1=50%, 2=75%, 3=100% of max notional
+ACTION_DIM: int = N_DIR  # Legacy alias (direction count)
+
+# --- Encoder dimensions ---
+GRU_HIDDEN: int = 128        # GRU hidden size per stream in MicroEncoder
+MACRO_EMBED_DIM: int = 64    # MacroEncoder MLP output dim
+FC_HIDDEN: int = 128         # FC hidden width in BDQ advantage/value heads
+
+# Legacy aliases kept for backward compatibility
+HIDDEN_SIZE: int = GRU_HIDDEN
+FC_SIZE: int = FC_HIDDEN
+DROPOUT_RATE: float = 0.0    # Paper does not specify dropout; set to 0
+
+# --- Hindsight bonus (Section 4.2) ---
+HINDSIGHT_HORIZON: int = 60   # h: look-ahead bars for hindsight bonus (paper searches [30,180])
+HINDSIGHT_WEIGHT: float = 0.01  # w: bonus coefficient (paper searches [1e-3, 1e-1])
+
+# --- Risk-aware auxiliary task (Section 4.4) ---
+AUX_TASK_ETA: float = 1.0    # η: relative importance of volatility prediction loss
+
+# --- Training hyperparameters (reference values — used in Colab notebooks) ---
 LEARNING_RATE: float = 3e-4
 BATCH_SIZE: int = 64
 REPLAY_BUFFER_CAPACITY: int = 50_000
