@@ -1,7 +1,7 @@
 # AlgoTrader — DeepScalper × Alpaca Paper Trading System
 
 End-to-end algorithmic intraday trading system for the **S&P 100** using:
-- **DeepScalper** — Double DQN + Prioritized Experience Replay, per-stock model
+- **DeepScalper** — Branching DQN (BDQ) + PER + Hindsight Bonus + Volatility Auxiliary Task (CIKM '22, Sun et al.)
 - **Lumibot** — Python broker execution framework
 - **Alpaca** — Paper trading API (no real money at risk)
 - **PyQt5** — Live dashboard with equity bar, positions table, confidence panel, trade log
@@ -22,7 +22,7 @@ algo_trader/
 │   ├── broker.py                    # Alpaca paper broker config
 │   ├── risk.py                      # Kelly sizing + ATR stops
 │   ├── circuit_breakers.py          # Session time guards + daily loss halt
-│   ├── state_builder.py             # Live bar → 11-feature state tensor
+│   ├── state_builder.py             # Live bars → {lob, priv, macro} observation dict for DeepScalperNet
 │   └── strategy.py                  # Lumibot Strategy class (core loop)
 ├── dashboard/
 │   ├── data_bridge.py               # Thread-safe state shared between threads
@@ -33,10 +33,10 @@ algo_trader/
 │   └── main_window.py               # Root QMainWindow
 ├── colab/
 │   ├── deepscalper/
-│   │   ├── architecture.py          # DuelingQNetwork (LSTM + attention + dueling)
-│   │   ├── agent.py                 # Double DQN agent + PER replay buffer
-│   │   ├── environment.py           # gym.Env for intraday trading simulation
-│   │   └── utils.py                 # Feature pipeline + metrics helpers
+│   │   ├── architecture.py          # DeepScalperNet — BDQ: MacroEncoder + dual-stream GRU MicroEncoder + VolatilityHead
+│   │   ├── agent.py                 # DeepScalperAgent — BDQ Double-DQN + PER + hindsight bonus + vol auxiliary task
+│   │   ├── environment.py           # ScalperEnv — Dict obs {lob,priv,macro}, MultiDiscrete([3,4]) action space
+│   │   └── utils.py                 # compute_macro_features (11) + compute_micro_features (5) + metrics helpers
 │   ├── 01_fetch_training_data.ipynb
 │   ├── 02_feature_engineering.ipynb
 │   ├── 03_train_deepscalper.ipynb
@@ -54,7 +54,7 @@ algo_trader/
 
 | Tool | Version | Notes |
 |------|---------|-------|
-| Python | 3.10+ | Tested on 3.10.x |
+| Python | 3.13+ | Tested on 3.13.x; PyTorch 2.6+ required for 3.13 wheels |
 | pip | 23+ | `pip install --upgrade pip` |
 | Git | Any | |
 | Alpaca account | Paper | [Sign up free](https://alpaca.markets/) |
@@ -77,9 +77,8 @@ python -m venv .venv
 pip install --upgrade pip
 pip install -r requirements.txt
 
-# For CPU-only PyTorch (saves ~1.5 GB):
-pip install torch==2.3.1+cpu torchvision==0.18.1+cpu \
-    --extra-index-url https://download.pytorch.org/whl/cpu
+# For CPU-only PyTorch (saves ~1.5 GB — Python 3.13 requires PyTorch 2.6+):
+pip install torch --extra-index-url https://download.pytorch.org/whl/cpu
 ```
 
 ---
@@ -106,10 +105,10 @@ Run the five Colab notebooks **in order**:
 | Notebook | Purpose | Runtime |
 |----------|---------|---------|
 | `01_fetch_training_data.ipynb` | Pull 6 months of 1-min bars from Alpaca | CPU, ~30 min |
-| `02_feature_engineering.ipynb` | Compute 11 features, build sliding windows | CPU, ~15 min |
-| `03_train_deepscalper.ipynb` | Train one model per ticker (Double DQN) | **T4 GPU**, ~4–8 h |
-| `04_export_and_push_weights.ipynb` | Copy `.pth` files and push to GitHub | CPU, ~5 min |
-| `05_backtest_validation.ipynb` | 30-day held-out backtest vs SPY | CPU, ~20 min |
+| `02_feature_engineering.ipynb` | Compute 11 macro + 5 micro features; save bar-level arrays | CPU, ~15 min |
+| `03_train_deepscalper.ipynb` | Train one `DeepScalperNet` per ticker (BDQ + PER + Hindsight + Vol Aux) | **T4 GPU**, ~4–8 h |
+| `04_export_and_push_weights.ipynb` | Validate checkpoint format, copy `.pth` files and push to GitHub | CPU, ~5 min |
+| `05_backtest_validation.ipynb` | Bar-by-bar greedy backtest on 20% held-out val set | CPU, ~20 min |
 
 ### Before running notebooks:
 
@@ -166,7 +165,7 @@ pytest tests/ -v
 
 Tests cover:
 - `test_risk.py` — Kelly sizing, ATR stop/TP calculation
-- `test_state_builder.py` — State tensor shape, NaN safety, column normalisation
+- `test_state_builder.py` — Dict observation format `{lob, priv, macro}`, shapes, dtype, NaN safety, backward-compat shim
 - `test_circuit_breakers.py` — Session time guards, daily loss halt, reset
 
 ---
@@ -176,9 +175,17 @@ Tests cover:
 | Parameter | Default | Description |
 |-----------|---------|-------------|
 | `LOOKBACK_BARS` | 60 | 1-min bars in observation window |
-| `INPUT_DIM` | 11 | Feature count per bar |
-| `HIDDEN_SIZE` | 128 | LSTM hidden units |
-| `CONFIDENCE_THRESHOLD` | 0.60 | Min action confidence to trade |
+| `MACRO_DIM` | 11 | Macro features per bar (Table 2 of paper) |
+| `LOB_DIM` | 5 | Micro/intrabar features (LOB proxy) |
+| `PRIV_DIM` | 2 | Private state: (position flag, unrealised P&L %) |
+| `N_DIR` | 3 | Direction branch: 0=HOLD 1=BUY 2=SELL |
+| `N_SIZE` | 4 | Size branch: 0=25% 1=50% 2=75% 3=100% of max notional |
+| `GRU_HIDDEN` | 128 | GRU hidden units per stream in MicroEncoder |
+| `MACRO_EMBED_DIM` | 64 | MacroEncoder MLP output dimension |
+| `FC_HIDDEN` | 128 | BDQ head fully-connected layer width |
+| `HINDSIGHT_HORIZON` | 60 | Look-ahead bars h for hindsight bonus (Section 4.2) |
+| `HINDSIGHT_WEIGHT` | 0.01 | Bonus coefficient w in r_H = r_t + w·log(P_{t+h}/P_t)·pos |
+| `AUX_TASK_ETA` | 1.0 | Volatility auxiliary task weight η (Section 4.4) |
 | `KELLY_FRACTION` | 0.5 | Half-Kelly position sizing |
 | `ATR_STOP_MULTIPLIER` | 2.0 | Stop loss = 2× ATR from entry |
 | `ATR_TP_MULTIPLIER` | 4.0 | Take profit = 4× ATR from entry |
