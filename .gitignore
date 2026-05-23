@@ -1,0 +1,35 @@
+
+# Python virtual environment
+.venv/
+venv/
+env/
+
+# Environment variables — NEVER commit this file
+algo_trader/.env
+.env
+
+# Weight files (large — use Git LFS or pull from releases)
+algo_trader/weights/*.pth
+
+# Logs
+algo_trader/algo_trader.log
+*.log
+
+# Python bytecode
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Jupyter notebook checkpoints
+.ipynb_checkpoints/
+
+# OS artefacts
+.DS_Store
+Thumbs.db
+
+# IDE settings
+.vscode/
+.idea/
+
+# pytest cache
+.pytest_cache/

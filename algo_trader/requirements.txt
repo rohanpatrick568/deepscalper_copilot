@@ -1,0 +1,62 @@
+# ==============================================================================
+# requirements.txt — DeepScalper AlgoTrader
+# All dependencies pinned for reproducibility.
+# ==============================================================================
+
+# --- Alpaca paper trading & data API (v2) ------------------------------------
+alpaca-py==0.26.0
+
+# --- Lumibot broker execution framework --------------------------------------
+lumibot==3.0.0
+
+# --- PyTorch (CPU build — sufficient for local inference) --------------------
+# For GPU support during local inference, remove +cpu and install the CUDA
+# variant:  pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
+# NOTE: In Google Colab the GPU version is pre-installed; do NOT pip install
+#       torch inside training notebooks — just import it.
+torch==2.3.1
+torchvision==0.18.1
+
+# --- Data science core -------------------------------------------------------
+numpy==1.26.4
+pandas==2.2.2
+scipy==1.13.1
+
+# --- Technical analysis (RSI, ATR, etc.) -------------------------------------
+ta==0.11.0
+
+# --- Parquet file I/O (Colab training data storage) --------------------------
+pyarrow==16.1.0
+
+# --- Reinforcement Learning environment --------------------------------------
+gymnasium==0.29.1
+
+# --- GUI (desktop dashboard) -------------------------------------------------
+PyQt5==5.15.11
+
+# --- Configuration & secrets -------------------------------------------------
+python-dotenv==1.0.1
+
+# --- Git integration (Colab weight export notebook) --------------------------
+gitpython==3.1.43
+
+# --- Timezone handling -------------------------------------------------------
+pytz==2024.1
+
+# --- HTTP requests (credential validation, rate-limit guard) -----------------
+requests==2.32.3
+
+# --- Progress bars (training loops, data fetch) ------------------------------
+tqdm==4.66.4
+
+# --- Visualisation (Colab notebooks only) ------------------------------------
+matplotlib==3.9.0
+seaborn==0.13.2
+
+# --- Testing -----------------------------------------------------------------
+pytest==8.2.2
+pytest-mock==3.14.0
+
+# --- Utilities ---------------------------------------------------------------
+# Used for Colab notebook cell output formatting
+tabulate==0.9.0
