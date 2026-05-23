@@ -1,13 +1,18 @@
 """
-execution/strategy.py — Core Lumibot Strategy: MultiStockDeepScalper.
+execution/strategy.py — Core Lumibot Strategy: CryptoDeepScalper.
 
-A single Lumibot Strategy subclass that:
-  • Loads 100 pre-trained DeepScalper DuelingQNetwork models at startup.
-  • On every 1-minute bar, runs inference for all 100 S&P 100 tickers.
-  • Routes BUY / SELL signals (with Kelly sizing and ATR stops) to Alpaca
-    Paper Trading via Lumibot's order API.
-  • Enforces circuit breakers and EOD position flattening.
+V2 CHANGE: Migrated from S&P 100 equities to BTC/USD cryptocurrency.
+
+A Lumibot Strategy subclass that:
+  • Loads a pre-trained DeepScalper BDQ model (N_DIR=2, FLAT/LONG) at startup.
+  • On every 1-minute bar, runs inference for BTC/USD.
+  • Routes LONG / exit-to-FLAT signals to Alpaca Crypto Trading via Lumibot.
+  • Enforces CryptoCitruitBreaker (24/7 conditions — no EOD session guards).
   • Publishes all state updates to a DataBridge for the PyQt5 dashboard.
+  • Uses real Alpaca LOB snapshots (top 3 bid/ask levels) for inference.
+
+No short selling: Alpaca crypto does not support short positions.
+Action space: Discrete(2) — 0=FLAT, 1=LONG.
 
 Threading note:
     Lumibot runs this strategy in its own internal thread.  All interactions
@@ -21,6 +26,8 @@ from collections import defaultdict, deque
 from pathlib import Path
 from typing import Dict, List, Optional
 
+import numpy as np
+import pandas as pd
 import torch
 import torch.nn.functional as F
 
@@ -34,19 +41,17 @@ from config import (
     LOB_DIM,
     PRIV_DIM,
     ATR_PERIOD,
-    CLOSE_ALL_EOD,
-    EOD_CLOSE_BUFFER_MIN,
     KELLY_FRACTION,
     LOOKBACK_BARS,
-    MARKET_CLOSE_HOUR,
-    MARKET_CLOSE_MINUTE,
-    MARKET_TIMEZONE,
     MAX_DAILY_LOSS_PCT,
     MAX_POSITION_PCT,
     SLEEP_TIME,
-    SP100_TICKERS,
+    CRYPTO_PAIRS,         # V2 CHANGE: was SP100_TICKERS
     STARTING_CAPITAL,
     WEIGHTS_DIR,
+    VOLATILITY_HALT_MULTIPLIER,   # V2 CHANGE: crypto circuit breaker
+    CONSECUTIVE_LOSS_HALT,        # V2 CHANGE: crypto circuit breaker
+    TRANSACTION_COST_LAMBDA,      # V2 CHANGE: 25 bps
 )
 from dashboard.data_bridge import (
     DataBridge,
@@ -54,9 +59,14 @@ from dashboard.data_bridge import (
     PositionSnapshot,
     TradeEvent,
 )
-from execution.circuit_breakers import CircuitBreaker
 from execution.risk import calculate_atr_stop, kelly_position_size
 from execution.state_builder import build_observation
+
+# V2 CHANGE: Crypto data clients instead of stock clients
+from alpaca.data.historical import CryptoHistoricalDataClient
+from alpaca.data.live import CryptoDataStream
+from alpaca.data.requests import CryptoBarsRequest, CryptoLatestOrderbookRequest
+from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
 
 # Import architecture — add colab directory to sys.path if needed
 _COLAB_PATH = Path(__file__).parent.parent / "colab"
@@ -64,53 +74,72 @@ if str(_COLAB_PATH) not in sys.path:
     sys.path.insert(0, str(_COLAB_PATH))
 
 from deepscalper.architecture import DeepScalperNet  # noqa: E402
+from deepscalper.utils import compute_micro_features   # V2: dual-mode LOB features
 
 from lumibot.entities import Asset
 from lumibot.strategies import Strategy
 
 import pytz
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 
 logger = logging.getLogger(__name__)
 
-_ET = pytz.timezone(MARKET_TIMEZONE)
-
-# Action index constants (must match environment.py and training)
-ACTION_HOLD = 0
-ACTION_BUY = 1
-ACTION_SELL = 2
-ACTION_NAMES = {ACTION_HOLD: "HOLD", ACTION_BUY: "BUY", ACTION_SELL: "SELL"}
+# V2 CHANGE: Binary action semantics (no short selling)
+ACTION_FLAT = 0
+ACTION_LONG = 1
+ACTION_NAMES = {ACTION_FLAT: "FLAT", ACTION_LONG: "LONG"}
 
 
-class MultiStockDeepScalper(Strategy):
-    """Unified multi-stock intraday strategy using DeepScalper DRL models.
+class CryptoDeepScalper(Strategy):
+    """V2: 24/7 crypto intraday strategy using DeepScalper BDQ model.
 
-    Loads one pre-trained DuelingQNetwork per S&P 100 ticker and runs inference
-    every 1-minute bar.  Routes all orders to Alpaca Paper Trading API via
-    Lumibot's built-in order management.
+    V2 CHANGES vs. MultiStockDeepScalper:
+      - Universe: BTC/USD (was S&P 100 equities)
+      - Actions: FLAT/LONG binary (no short selling — Alpaca crypto limitation)
+      - Session guards: removed (crypto is 24/7)
+      - Circuit breaker: CryptoCitruitBreaker (ATR spike + rolling loss + streak)
+      - LOB features: real Alpaca orderbook (top 3 bid/ask) with proxy fallback
+      - Weights file: BTC_USD.pth
 
     Args:
         data_bridge: Shared DataBridge instance for dashboard state updates.
+        alpaca_api_key: Alpaca API key for data client (not broker auth).
+        alpaca_secret_key: Alpaca secret key for data client.
         **kwargs: Passed through to the Lumibot Strategy base class.
     """
 
-    # Minimum number of historical trades per ticker before using Kelly sizing
+    # Minimum number of historical trades before using Kelly sizing
     _MIN_TRADES_FOR_KELLY: int = 5
 
-    def __init__(self, data_bridge: DataBridge, **kwargs) -> None:
+    def __init__(
+        self,
+        data_bridge: DataBridge,
+        alpaca_api_key: str,
+        alpaca_secret_key: str,
+        **kwargs,
+    ) -> None:
         super().__init__(**kwargs)
         self._data_bridge: DataBridge = data_bridge
         self._models: Dict[str, DeepScalperNet] = {}
-        self._circuit_breaker: Optional[CircuitBreaker] = None
+        self._crypto_circuit_breaker: Optional["CryptoCitruitBreaker"] = None
 
-        # Per-ticker win/loss tracking for Kelly sizing
-        # deque stores tuples of (pnl_dollars: float, is_win: bool)
+        # Alpaca crypto data client for LOB snapshots
+        self._data_client = CryptoHistoricalDataClient(
+            api_key=alpaca_api_key,
+            secret_key=alpaca_secret_key,
+        )
+
+        # Per-pair win/loss tracking for Kelly sizing
         self._trade_history: Dict[str, deque] = defaultdict(lambda: deque(maxlen=50))
 
         # Track entry prices and stops for open positions
         self._entry_prices: Dict[str, float] = {}
-        self._stop_prices: Dict[str, float] = {}
-        self._tp_prices: Dict[str, float] = {}
+        self._stop_prices:  Dict[str, float] = {}
+        self._tp_prices:    Dict[str, float] = {}
+
+        # 24-hour rolling returns for circuit breaker
+        self._hourly_returns: deque = deque(maxlen=24)
+        self._consecutive_losses: int = 0
 
     # ------------------------------------------------------------------
     # Lumibot lifecycle hooks
@@ -119,135 +148,125 @@ class MultiStockDeepScalper(Strategy):
     def initialize(self) -> None:
         """Called once at strategy startup.
 
-        Loads model weights, configures the circuit breaker, and validates
+        Loads model weights, instantiates CryptoCitruitBreaker, validates
         the Alpaca connection.
         """
         self.sleeptime = SLEEP_TIME
 
         logger.info("=" * 60)
-        logger.info("MultiStockDeepScalper — initialising")
-        logger.info("Capital: $%.2f | Universe: %d tickers", STARTING_CAPITAL, len(SP100_TICKERS))
+        logger.info("CryptoDeepScalper — initialising (V2 crypto)")
+        logger.info("Capital: $%.2f | Universe: %s", STARTING_CAPITAL, CRYPTO_PAIRS)
         logger.info("=" * 60)
 
-        # Load all model weights
+        # Load model weights
         self._load_models()
 
-        # Instantiate circuit breaker
-        self._circuit_breaker = CircuitBreaker(
-            max_daily_loss_pct=MAX_DAILY_LOSS_PCT,
-            starting_capital=STARTING_CAPITAL,
+        # V2 CHANGE: CryptoCitruitBreaker (not equity CircuitBreaker)
+        self._crypto_circuit_breaker = CryptoCitruitBreaker(
+            max_24h_loss_pct          = MAX_DAILY_LOSS_PCT,
+            volatility_halt_multiplier = VOLATILITY_HALT_MULTIPLIER,
+            consecutive_loss_halt      = CONSECUTIVE_LOSS_HALT,
+            starting_capital           = STARTING_CAPITAL,
         )
 
-        # Publish initial dashboard state
         self._data_bridge.portfolio_value = STARTING_CAPITAL
 
         logger.info(
             "Initialisation complete. %d/%d models loaded.",
             len(self._models),
-            len(SP100_TICKERS),
+            len(CRYPTO_PAIRS),
         )
 
     def before_market_opens(self) -> None:
-        """Reset daily circuit breaker state at the start of each session."""
-        if self._circuit_breaker:
-            self._circuit_breaker.reset_for_new_day()
+        """V2 CHANGE: Crypto is 24/7 — no meaningful session open.
+        Kept for Lumibot compatibility; resets circuit breaker daily counters.
+        """
+        if self._crypto_circuit_breaker:
+            self._crypto_circuit_breaker.reset_for_new_utc_day()
         self._data_bridge.is_halted = False
         self._data_bridge.halt_reason = ""
-        logger.info("Market open: circuit breaker reset.")
+        logger.info("UTC day boundary: circuit breaker daily counters reset.")
 
     def after_market_closes(self) -> None:
-        """Log daily summary statistics after session close."""
+        """V2 CHANGE: No-op for crypto (no session close).
+        Logs daily summary for monitoring purposes only.
+        """
         portfolio = self.get_portfolio_value()
         pnl = portfolio - STARTING_CAPITAL
         logger.info(
-            "Session ended. Portfolio: $%.2f | Daily P&L: $%.2f",
+            "UTC day ended. Portfolio: $%.2f | Daily P&L: $%.2f",
             portfolio,
             pnl,
         )
 
     def on_trading_iteration(self) -> None:
-        """Called every 1 minute during market hours.
+        """Called every 1 minute, 24/7.
 
-        Checks circuit breakers, runs model inference for all 100 tickers,
-        and routes qualifying signals to Alpaca via Lumibot.
+        V2 CHANGE: Removed EOD session guards (crypto has no market close).
+        Checks CryptoCitruitBreaker, then runs inference for CRYPTO_PAIRS.
         """
         # ----------------------------------------------------------------
-        # Step 1: Circuit breaker check
+        # Step 1: CryptoCitruitBreaker check (V2 CHANGE: replaces CircuitBreaker)
         # ----------------------------------------------------------------
-        halted, reason = self._circuit_breaker.is_trading_halted()
-        if halted:
-            logger.info("Trading halted: %s", reason)
-            self._data_bridge.is_halted = True
-            self._data_bridge.halt_reason = reason
-            self._push_event("HALT", "ALL", 0, 0.0, reason)
-            return
+        if self._crypto_circuit_breaker:
+            halted, reason = self._crypto_circuit_breaker.is_trading_halted()
+            if halted:
+                logger.info("Crypto trading halted: %s", reason)
+                self._data_bridge.is_halted = True
+                self._data_bridge.halt_reason = reason
+                self._push_event("HALT", "ALL", 0, 0.0, reason)
+                return
 
         self._data_bridge.is_halted = False
         self._data_bridge.halt_reason = ""
 
-        # ----------------------------------------------------------------
-        # Step 2: EOD position flattening
-        # ----------------------------------------------------------------
-        if CLOSE_ALL_EOD and self._is_eod_close_time():
-            self._close_all_positions(reason="EOD_CLOSE")
-            return
+        # V2 CHANGE: No EOD close guard (crypto 24/7)
 
         # ----------------------------------------------------------------
-        # Step 3: Iterate over all tickers and run inference
+        # Step 2: Run inference for BTC/USD
         # ----------------------------------------------------------------
-        portfolio_value = self.get_portfolio_value()
-        current_positions = {p.asset.symbol: p for p in self.get_positions()}
+        portfolio_value   = self.get_portfolio_value()
+        current_positions = {str(p.asset.symbol): p for p in self.get_positions()}
 
-        for ticker in SP100_TICKERS:
-            if ticker not in self._models:
-                continue  # Weight file was missing at startup; skip
-
-            self._process_ticker(ticker, portfolio_value, current_positions)
+        for pair in CRYPTO_PAIRS:
+            if pair not in self._models:
+                continue
+            self._process_pair(pair, portfolio_value, current_positions)
 
         # ----------------------------------------------------------------
-        # Step 4: Push portfolio snapshot to dashboard
+        # Step 3: Push portfolio snapshot to dashboard
         # ----------------------------------------------------------------
         self._push_portfolio_snapshot(portfolio_value)
 
     def on_filled_order(self, position, order, price, quantity, multiplier) -> None:
         """Called by Lumibot on every order fill.
 
-        Updates circuit breaker daily P&L, logs the fill to the trade log,
-        and records win/loss stats for Kelly sizing.
-
-        Args:
-            position: Lumibot Position object after the fill.
-            order: The filled Order object.
-            price: Fill price.
-            quantity: Number of shares filled.
-            multiplier: Contract multiplier (1 for equities).
+        Updates circuit breaker P&L, logs fill, records win/loss for Kelly.
         """
-        symbol = order.asset.symbol
-        side = order.side  # "buy" or "sell"
+        symbol = str(order.asset.symbol)  # 'BTCUSD' or 'BTC'
+        side   = order.side               # 'buy' or 'sell'
 
-        timestamp = datetime.now(_ET).strftime("%H:%M:%S")
+        timestamp = datetime.now(timezone.utc).strftime("%H:%M:%S UTC")
         logger.info(
-            "FILL: %s %d %s @ $%.2f",
+            "FILL: %s %.6f %s @ $%.2f",
             side.upper(),
-            int(quantity),
+            float(quantity),
             symbol,
             price,
         )
 
-        # Log to DataBridge trade log
         event_type = "FILL"
-        self._push_event(event_type, symbol, int(quantity), price, side.upper())
+        self._push_event(event_type, symbol, float(quantity), price, side.upper())
 
-        # On a closing sell, calculate P&L and update Kelly stats
+        # V2 CHANGE: No short selling — only LONG exits (sell-side)
         if side == "sell" and symbol in self._entry_prices:
-            entry = self._entry_prices.pop(symbol, price)
-            trade_pnl = (price - entry) * quantity
-            is_win = trade_pnl > 0
+            entry    = self._entry_prices.pop(symbol, price)
+            trade_pnl = (price - entry) * float(quantity)
+            is_win    = trade_pnl > 0
+            self._trade_history[symbol].append({"pnl": trade_pnl, "is_win": is_win})
 
-            self._trade_history[symbol].append(
-                {"pnl": trade_pnl, "is_win": is_win}
-            )
-            self._circuit_breaker.update_daily_pnl(trade_pnl)
+            if self._crypto_circuit_breaker:
+                self._crypto_circuit_breaker.record_trade(trade_pnl, is_win)
 
             logger.info(
                 "CLOSED %s: P&L $%.2f (%s)",
@@ -256,75 +275,133 @@ class MultiStockDeepScalper(Strategy):
                 "WIN" if is_win else "LOSS",
             )
         elif side == "buy":
-            self._entry_prices[symbol] = price
+            self._entry_prices[symbol] = float(price)
 
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
 
     def _load_models(self) -> None:
-        """Load all DeepScalperNet weights from WEIGHTS_DIR into self._models."""
+        """Load DeepScalperNet weights for each crypto pair from WEIGHTS_DIR."""
         weights_path = Path(WEIGHTS_DIR)
         loaded = 0
         missing = []
 
-        for ticker in SP100_TICKERS:
-            pth_file = weights_path / f"{ticker}.pth"
+        for pair in CRYPTO_PAIRS:
+            safe_name = pair.replace('/', '_')   # 'BTC/USD' → 'BTC_USD'
+            pth_file  = weights_path / f"{safe_name}.pth"
             if not pth_file.exists():
-                missing.append(ticker)
+                missing.append(pair)
                 continue
 
             model = DeepScalperNet(
-                macro_dim=MACRO_DIM,
-                lob_dim=LOB_DIM,
-                priv_dim=PRIV_DIM,
-                gru_hidden=GRU_HIDDEN,
-                macro_embed=MACRO_EMBED_DIM,
-                fc_hidden=FC_HIDDEN,
-                n_dir=N_DIR,
-                n_size=N_SIZE,
+                macro_dim   = MACRO_DIM,
+                lob_dim     = LOB_DIM,
+                priv_dim    = PRIV_DIM,
+                gru_hidden  = GRU_HIDDEN,
+                macro_embed = MACRO_EMBED_DIM,
+                fc_hidden   = FC_HIDDEN,
+                n_dir       = N_DIR,
+                n_size      = N_SIZE,
             )
             try:
                 ckpt = torch.load(str(pth_file), map_location="cpu", weights_only=True)
-                # Support both raw state_dict and agent checkpoint
                 state_dict = ckpt.get("online_net", ckpt)
                 model.load_state_dict(state_dict)
                 model.eval()
-                self._models[ticker] = model
+                self._models[pair] = model
                 loaded += 1
             except Exception as exc:
-                logger.error("Failed to load weights for %s: %s", ticker, exc)
-                missing.append(ticker)
+                logger.error("Failed to load weights for %s: %s", pair, exc)
+                missing.append(pair)
 
         if missing:
-            logger.warning(
-                "Could not load weights for %d tickers: %s",
-                len(missing),
-                missing,
-            )
+            logger.warning("Could not load weights for: %s", missing)
 
-        logger.info("Loaded %d/%d model weights.", loaded, len(SP100_TICKERS))
+        logger.info("Loaded %d/%d model weights.", loaded, len(CRYPTO_PAIRS))
 
-    def _process_ticker(
+    @staticmethod
+    def _get_crypto_asset(pair: str) -> Asset:
+        """V2 CHANGE: Build Lumibot Asset for a crypto pair.
+
+        Alpaca symbol formats:
+          Data API   : 'BTC/USD' (with slash)
+          Trading API: 'BTCUSD'  (no slash)
+          Lumibot    : Asset(symbol='BTC', asset_type=Asset.AssetType.CRYPTO)
+        """
+        base = pair.split('/')[0]   # 'BTC/USD' → 'BTC'
+        return Asset(symbol=base, asset_type=Asset.AssetType.CRYPTO)
+
+    def _get_live_lob_features(self, pair: str) -> np.ndarray:
+        """V2 CHANGE: Fetch real Alpaca orderbook and compute 4 LOB features.
+
+        Extracts top 3 bid/ask levels from CryptoLatestOrderbookRequest and
+        computes microstructure features in real-LOB mode.  Falls back to
+        proxy (OHLCV-based) on any exception.
+
+        Args:
+            pair: Alpaca data-API symbol string e.g. 'BTC/USD'.
+
+        Returns:
+            float32 array of shape (1, 4) — single-bar LOB features.
+        """
+        try:
+            req = CryptoLatestOrderbookRequest(symbol_or_symbols=pair)
+            ob  = self._data_client.get_crypto_latest_orderbook(req)
+            book = ob[pair]
+
+            # Build a one-row DataFrame matching compute_micro_features(use_proxy=False)
+            lob_row = {}
+            for level, bid, ask in zip([1, 2, 3], book.bids[:3], book.asks[:3]):
+                lob_row[f'bid_price_{level}'] = float(bid.p)
+                lob_row[f'bid_size_{level}']  = float(bid.s)
+                lob_row[f'ask_price_{level}'] = float(ask.p)
+                lob_row[f'ask_size_{level}']  = float(ask.s)
+
+            lob_snap = pd.DataFrame([lob_row])
+
+            # Placeholder OHLCV for the wrapper signature
+            dummy_bars = pd.DataFrame({
+                'open': [lob_snap['bid_price_1'].iloc[0]],
+                'high': [lob_snap['ask_price_1'].iloc[0]],
+                'low':  [lob_snap['bid_price_1'].iloc[0]],
+                'close':[lob_snap['ask_price_1'].iloc[0]],
+                'volume': [1.0],
+            })
+
+            features = compute_micro_features(
+                bars=dummy_bars, lob_snapshots=lob_snap, use_proxy=False
+            )  # (1, 4)
+            return features.astype(np.float32)
+
+        except Exception as exc:
+            logger.warning("LOB fetch failed for %s (%s); using proxy.", pair, exc)
+            return None   # Caller falls back to OHLCV proxy
+
+    def _process_pair(
         self,
-        ticker: str,
+        pair: str,
         portfolio_value: float,
         current_positions: dict,
     ) -> None:
-        """Run inference for a single ticker and submit orders if warranted.
+        """V2 CHANGE: Run inference for a single crypto pair and submit orders.
+
+        Action 0=FLAT: If currently long → exit. If flat → hold.
+        Action 1=LONG: If currently flat → enter. If long → hold.
+        No short selling.
 
         Args:
-            ticker: Stock symbol.
+            pair: Alpaca data-API symbol string e.g. 'BTC/USD'.
             portfolio_value: Current portfolio value in USD.
-            current_positions: Dict mapping symbol → Position for open positions.
+            current_positions: Dict mapping symbol key → Position for open positions.
         """
-        asset = Asset(ticker, asset_type="stock")
+        asset = self._get_crypto_asset(pair)  # Asset(symbol='BTC', asset_type=CRYPTO)
 
         # Fetch historical bars
         try:
             bars_obj = self.get_historical_prices(asset, LOOKBACK_BARS + 5, "minute")
         except Exception as exc:
-            logger.debug("Could not fetch bars for %s: %s", ticker, exc)
+            logger.debug("Could not fetch bars for %s: %s", pair, exc)
             return
 
         if bars_obj is None:
@@ -334,103 +411,111 @@ class MultiStockDeepScalper(Strategy):
         if bars is None or len(bars) < LOOKBACK_BARS:
             logger.debug(
                 "%s: insufficient bars (%d < %d), skipping",
-                ticker,
+                pair,
                 len(bars) if bars is not None else 0,
                 LOOKBACK_BARS,
             )
             return
 
-        # Determine current position flag and unrealized P&L for private state
-        pos_obj = current_positions.get(ticker)
-        position_flag = 0
+        # V2 CHANGE: Track position flag (0=flat, 1=long — no short)
+        trading_symbol = pair.replace('/', '')   # 'BTC/USD' → 'BTCUSD'
+        pos_obj = current_positions.get(trading_symbol) or current_positions.get('BTC')
+        position_flag  = 0
         unrealized_pnl_pct = 0.0
-        if pos_obj is not None and pos_obj.quantity != 0:
-            position_flag = 1 if pos_obj.quantity > 0 else -1
-            entry = self._entry_prices.get(ticker, 0.0)
-            last_price = self._get_last_price(ticker) or 0.0
+        is_long = False
+
+        if pos_obj is not None and float(pos_obj.quantity) > 0:
+            position_flag = 1
+            is_long = True
+            entry = self._entry_prices.get(trading_symbol, 0.0)
+            last_price = self._get_last_price_crypto(pair) or 0.0
             if entry > 0 and last_price > 0:
-                unrealized_pnl_pct = (last_price - entry) / entry * position_flag
+                unrealized_pnl_pct = (last_price - entry) / entry
 
-        # Build dict observation
-        obs = build_observation(bars, position=position_flag, unrealized_pnl_pct=unrealized_pnl_pct)
+        # V2 CHANGE: Try real LOB features; fall back to proxy on failure
+        lob_snap = self._get_live_lob_features(pair)   # (1, 4) or None
+        if lob_snap is None:
+            lob_snap = compute_micro_features(bars, use_proxy=True)  # (n, 4)
 
-        # Run BDQ inference (no_grad prevents gradient accumulation)
-        model = self._models[ticker]
+        obs = build_observation(
+            bars,
+            position      = position_flag,
+            unrealized_pnl_pct = unrealized_pnl_pct,
+            lob_override  = lob_snap,   # inject real/proxy LOB into obs builder
+        )
+
+        # Run BDQ inference
+        model = self._models[pair]
         with torch.no_grad():
-            q_dir, q_size, _ = model(
-                obs['lob'], obs['priv'], obs['macro']
-            )  # q_dir: (1, N_DIR), q_size: (1, N_SIZE)
+            q_dir, _q_size, _ = model(obs['lob'], obs['priv'], obs['macro'])
 
-        q_np = q_dir.squeeze(0).cpu().numpy()  # (N_DIR,) — use direction branch
-        action = int(q_np.argmax())
+        q_np   = q_dir.squeeze(0).cpu().numpy()   # (N_DIR=2,)
+        action = int(q_np.argmax())                # 0=FLAT, 1=LONG
         confidence = float(F.softmax(torch.from_numpy(q_np), dim=0).max())
 
-        # Push signal to dashboard regardless of whether we trade
-        self._publish_signal(ticker, action, q_np.tolist(), confidence)
-
-        # Resolve whether we currently hold this ticker
-        is_long = ticker in current_positions
+        self._publish_signal(pair, action, q_np.tolist(), confidence)
 
         current_price = float(bars["close"].iloc[-1])
 
-        # ---- BUY logic ----
-        if action == ACTION_BUY and not is_long:
-            self._submit_buy(ticker, asset, bars, current_price, portfolio_value)
-
-        # ---- SELL logic ----
-        elif action == ACTION_SELL and is_long:
-            self._submit_sell(ticker, asset, current_price)
+        # V2 CHANGE: Binary FLAT/LONG logic — no short selling
+        if action == ACTION_LONG and not is_long:
+            # Enter long
+            self._submit_buy(trading_symbol, asset, bars, current_price, portfolio_value)
+        elif action == ACTION_FLAT and is_long:
+            # Exit long (do NOT enter short)
+            self._submit_sell(trading_symbol, asset, current_price)
+        # else: already in desired state, hold
 
     def _submit_buy(
         self,
-        ticker: str,
+        symbol: str,
         asset: Asset,
         bars,
         current_price: float,
         portfolio_value: float,
     ) -> None:
-        """Calculate position size and submit a bracket BUY order.
+        """V2 CHANGE: Calculate fractional crypto position size and submit BUY.
 
-        Args:
-            ticker: Stock symbol.
-            asset: Lumibot Asset object.
-            bars: Historical OHLCV DataFrame.
-            current_price: Latest close price.
-            portfolio_value: Current total portfolio value.
+        Alpaca crypto supports fractional quantities, so we size in notional
+        USD then convert to fractional BTC.
         """
         # Kelly position sizing using recent win/loss history
-        history = list(self._trade_history[ticker])
+        history = list(self._trade_history[symbol])
         if len(history) >= self._MIN_TRADES_FOR_KELLY:
-            wins = [h for h in history if h["is_win"]]
+            wins   = [h for h in history if h["is_win"]]
             losses = [h for h in history if not h["is_win"]]
             win_rate = len(wins) / len(history)
-            avg_win = abs(sum(h["pnl"] for h in wins) / len(wins)) if wins else 1.0
+            avg_win  = abs(sum(h["pnl"] for h in wins)  / len(wins))  if wins   else 1.0
             avg_loss = abs(sum(h["pnl"] for h in losses) / len(losses)) if losses else 1.0
         else:
-            # Insufficient history: use conservative defaults
-            win_rate = 0.5
-            avg_win = current_price * 0.005   # 0.5 % average win
-            avg_loss = current_price * 0.0025  # 0.25 % average loss
+            win_rate = 0.50
+            avg_win  = current_price * 0.005
+            avg_loss = current_price * 0.0025
 
-        shares = kelly_position_size(
-            win_rate=win_rate,
-            avg_win=avg_win,
-            avg_loss=avg_loss,
-            portfolio_value=portfolio_value,
-            price=current_price,
-            kelly_fraction=KELLY_FRACTION,
-            max_position_pct=MAX_POSITION_PCT,
-        )
+        notional = kelly_position_size(
+            win_rate         = win_rate,
+            avg_win          = avg_win,
+            avg_loss         = avg_loss,
+            portfolio_value  = portfolio_value,
+            price            = current_price,
+            kelly_fraction   = KELLY_FRACTION,
+            max_position_pct = MAX_POSITION_PCT,
+        ) * current_price   # convert shares → notional USD
 
-        # ATR-based stops
+        # V2 CHANGE: crypto fractional quantity
+        qty = round(notional / current_price, 6)
+        if qty < 0.000001:
+            logger.debug("Skipping BUY %s: position size too small (%.8f BTC)", symbol, qty)
+            return
+
         stop_price, tp_price = calculate_atr_stop(bars, current_price, "buy")
-        self._stop_prices[ticker] = stop_price
-        self._tp_prices[ticker] = tp_price
+        self._stop_prices[symbol] = stop_price
+        self._tp_prices[symbol]   = tp_price
 
         try:
             order = self.create_order(
                 asset,
-                shares,
+                qty,
                 "buy",
                 order_class="bracket",
                 stop_loss_price=stop_price,
@@ -438,125 +523,99 @@ class MultiStockDeepScalper(Strategy):
             )
             self.submit_order(order)
             logger.info(
-                "BUY %d %s @ ~$%.2f | stop=$%.2f tp=$%.2f",
-                shares,
-                ticker,
-                current_price,
-                stop_price,
-                tp_price,
+                "BUY %.6f %s @ ~$%.2f | stop=$%.2f tp=$%.2f",
+                qty, symbol, current_price, stop_price, tp_price,
             )
         except Exception as exc:
-            logger.error("Failed to submit BUY for %s: %s", ticker, exc)
+            logger.error("Failed to submit BUY for %s: %s", symbol, exc)
 
-    def _submit_sell(self, ticker: str, asset: Asset, current_price: float) -> None:
-        """Submit a market SELL order to close an existing long position.
+    def _submit_sell(self, symbol: str, asset: Asset, current_price: float) -> None:
+        """V2 CHANGE: Submit market SELL to exit long position (no short entry).
 
-        Args:
-            ticker: Stock symbol.
-            asset: Lumibot Asset object.
-            current_price: Latest close price (for logging only).
+        Alpaca crypto supports fractional sell quantities.
         """
         try:
             position = self.get_position(asset)
-            if position and position.quantity > 0:
-                order = self.create_order(asset, position.quantity, "sell")
+            if position and float(position.quantity) > 0:
+                order = self.create_order(asset, float(position.quantity), "sell")
                 self.submit_order(order)
                 logger.info(
-                    "SELL %d %s @ ~$%.2f (model signal)",
-                    int(position.quantity),
-                    ticker,
-                    current_price,
+                    "SELL %.6f %s @ ~$%.2f (model FLAT signal)",
+                    float(position.quantity), symbol, current_price,
                 )
         except Exception as exc:
-            logger.error("Failed to submit SELL for %s: %s", ticker, exc)
+            logger.error("Failed to submit SELL for %s: %s", symbol, exc)
 
-    def _close_all_positions(self, reason: str = "EOD_CLOSE") -> None:
-        """Flatten all open positions (EOD or circuit-breaker triggered).
+    def _close_all_positions(self, reason: str = "CIRCUIT_BREAKER") -> None:
+        """Flatten all open crypto positions.
 
-        Args:
-            reason: Human-readable reason string for the dashboard log.
+        V2 CHANGE: 'reason' default is CIRCUIT_BREAKER (not EOD_CLOSE).
         """
         logger.info("Closing all positions: %s", reason)
         positions = self.get_positions()
         if not positions:
             return
 
-        for position in positions:
-            try:
-                self.sell_all()
-                break  # sell_all covers everything; no need to loop further
-            except Exception as exc:
-                logger.error("sell_all failed: %s — trying per-position close", exc)
-                for pos in self.get_positions():
-                    try:
-                        order = self.create_order(pos.asset, pos.quantity, "sell")
-                        self.submit_order(order)
-                    except Exception as e2:
-                        logger.error("Could not close %s: %s", pos.asset.symbol, e2)
-                break
+        try:
+            self.sell_all()
+        except Exception as exc:
+            logger.error("sell_all failed: %s — trying per-position close", exc)
+            for pos in self.get_positions():
+                try:
+                    order = self.create_order(pos.asset, float(pos.quantity), "sell")
+                    self.submit_order(order)
+                except Exception as e2:
+                    logger.error("Could not close %s: %s", pos.asset.symbol, e2)
 
         self._push_event(reason, "ALL", 0, 0.0, reason)
 
-    def _is_eod_close_time(self) -> bool:
-        """Return True if we are within EOD_CLOSE_BUFFER_MIN minutes of market close."""
-        now = datetime.now(_ET)
-        close_minute = MARKET_CLOSE_HOUR * 60 + MARKET_CLOSE_MINUTE
-        now_minute = now.hour * 60 + now.minute
-        return now_minute >= close_minute - EOD_CLOSE_BUFFER_MIN
-
     def _publish_signal(
         self,
-        ticker: str,
+        pair: str,
         action: int,
         q_values: List[float],
         confidence: float,
     ) -> None:
-        """Push the latest model signal to DataBridge for the dashboard.
-
-        Args:
-            ticker: Stock symbol.
-            action: Predicted action index (0=HOLD, 1=BUY, 2=SELL).
-            q_values: Raw Q-values as a 3-element list.
-            confidence: Softmax-derived confidence score in [0, 1].
-        """
+        """Push the latest model signal to DataBridge for the dashboard."""
         signal = ModelSignal(
-            symbol=ticker,
-            action=ACTION_NAMES[action],
-            q_values=q_values,
-            confidence=confidence,
-            timestamp=datetime.now(_ET).strftime("%H:%M:%S"),
+            symbol     = pair,
+            action     = ACTION_NAMES[action],
+            q_values   = q_values,
+            confidence = confidence,
+            timestamp  = datetime.now(timezone.utc).strftime("%H:%M:%S UTC"),
         )
-        self._data_bridge.update_signal(ticker, signal)
+        self._data_bridge.update_signal(pair, signal)
 
     def _push_portfolio_snapshot(self, portfolio_value: float) -> None:
-        """Update DataBridge with current portfolio value and open positions.
-
-        Args:
-            portfolio_value: Total portfolio value in USD.
-        """
+        """Update DataBridge with current portfolio value and open positions."""
         self._data_bridge.portfolio_value = portfolio_value
-        daily_pnl = self._circuit_breaker.daily_pnl if self._circuit_breaker else 0.0
+        daily_pnl = (
+            self._crypto_circuit_breaker.daily_pnl
+            if self._crypto_circuit_breaker
+            else 0.0
+        )
         self._data_bridge.daily_pnl = daily_pnl
 
-        # Push position snapshots
-        positions = self.get_positions()
+        positions  = self.get_positions()
         snapshots: Dict[str, PositionSnapshot] = {}
         for pos in positions:
-            symbol = pos.asset.symbol
-            current_price = self._get_last_price(symbol) or 0.0
+            symbol        = str(pos.asset.symbol)
+            current_price = self._get_last_price_crypto(
+                f"{symbol}/USD"
+            ) or 0.0
             entry = self._entry_prices.get(symbol, current_price)
-            qty = int(pos.quantity)
-            upnl = (current_price - entry) * qty
+            qty   = float(pos.quantity)
+            upnl  = (current_price - entry) * qty
 
             snapshots[symbol] = PositionSnapshot(
-                symbol=symbol,
-                side="LONG" if qty > 0 else "SHORT",
-                qty=abs(qty),
-                entry_price=entry,
-                current_price=current_price,
-                unrealized_pnl=upnl,
-                atr_stop=self._stop_prices.get(symbol, 0.0),
-                atr_tp=self._tp_prices.get(symbol, 0.0),
+                symbol         = symbol,
+                side           = "LONG" if qty > 0 else "FLAT",
+                qty            = abs(qty),
+                entry_price    = entry,
+                current_price  = current_price,
+                unrealized_pnl = upnl,
+                atr_stop       = self._stop_prices.get(symbol, 0.0),
+                atr_tp         = self._tp_prices.get(symbol, 0.0),
             )
 
         self._data_bridge.update_positions(snapshots)
@@ -565,41 +624,172 @@ class MultiStockDeepScalper(Strategy):
         self,
         event_type: str,
         symbol: str,
-        qty: int,
+        qty: float,
         price: float,
         detail: str,
     ) -> None:
-        """Append an event to the DataBridge trade log.
-
-        Args:
-            event_type: One of "FILL", "HALT", "EOD_CLOSE", etc.
-            symbol: Stock symbol or "ALL".
-            qty: Share quantity (0 for non-trade events).
-            price: Fill price (0.0 for non-trade events).
-            detail: Human-readable description or side string.
-        """
+        """Append an event to the DataBridge trade log."""
         event = TradeEvent(
-            timestamp=datetime.now(_ET).strftime("%H:%M:%S"),
-            symbol=symbol,
-            side=detail,
-            qty=qty,
-            price=price,
-            event_type=event_type,
+            timestamp  = datetime.now(timezone.utc).strftime("%H:%M:%S UTC"),
+            symbol     = symbol,
+            side       = detail,
+            qty        = qty,
+            price      = price,
+            event_type = event_type,
         )
         self._data_bridge.append_trade_event(event)
 
-    def _get_last_price(self, symbol: str) -> Optional[float]:
-        """Fetch the last available price for a symbol via Lumibot.
+    def _get_last_price_crypto(self, pair: str) -> Optional[float]:
+        """V2 CHANGE: Fetch last price for a crypto pair from Alpaca data client.
 
         Args:
-            symbol: Stock ticker string.
+            pair: Symbol in data-API format e.g. 'BTC/USD'.
 
         Returns:
             Last trade price as float, or None if unavailable.
         """
         try:
-            asset = Asset(symbol, asset_type="stock")
-            price = self.get_last_price(asset)
-            return float(price) if price else None
+            from alpaca.data.requests import CryptoLatestBarRequest
+            req  = CryptoLatestBarRequest(symbol_or_symbols=pair)
+            bars = self._data_client.get_crypto_latest_bar(req)
+            return float(bars[pair].close)
         except Exception:
             return None
+
+    def _get_last_price(self, symbol: str) -> Optional[float]:
+        """Legacy equity price lookup — kept for DataBridge compat."""
+        return self._get_last_price_crypto(f"{symbol}/USD")
+
+
+# =============================================================================
+# V2 CHANGE: CryptoCitruitBreaker — replaces equity CircuitBreaker
+# =============================================================================
+
+class CryptoCitruitBreaker:
+    """24/7 crypto-aware circuit breaker with three independent halt conditions.
+
+    V2 CHANGE: Three halt conditions (no market-hours dependency):
+
+    1. 24-hour rolling loss gate:
+       Halt if cumulative P&L over the last 24 hours exceeds
+       -max_24h_loss_pct × starting_capital.
+
+    2. ATR-spike volatility gate:
+       Halt if current 1-min |return| > volatility_halt_multiplier × 72-hour
+       baseline ATR.  Prevents entering positions during flash crashes or pumps.
+
+    3. Consecutive-loss streak gate:
+       Halt for 30 minutes after consecutive_loss_halt consecutive losing trades.
+       Prevents revenge-trading during adverse market conditions.
+
+    All halts are temporary: once the cooldown period ends and the condition
+    clears, trading resumes automatically.
+
+    Args:
+        max_24h_loss_pct           : Maximum 24-hour portfolio loss before halt (0.05 = 5%).
+        volatility_halt_multiplier : ATR spike multiplier before halt (4.0 = 4× baseline).
+        consecutive_loss_halt      : Number of consecutive losses before streak halt (8).
+        starting_capital           : Portfolio starting value (for loss % calculation).
+        cooldown_minutes           : Minutes to hold the halt after a streak trigger (30).
+    """
+
+    def __init__(
+        self,
+        max_24h_loss_pct:          float = 0.05,
+        volatility_halt_multiplier: float = 4.0,
+        consecutive_loss_halt:     int   = 8,
+        starting_capital:          float = 10_000.0,
+        cooldown_minutes:          int   = 30,
+    ) -> None:
+        self.max_24h_loss_pct           = max_24h_loss_pct
+        self.volatility_halt_multiplier = volatility_halt_multiplier
+        self.consecutive_loss_halt      = consecutive_loss_halt
+        self.starting_capital           = starting_capital
+        self.cooldown_minutes           = cooldown_minutes
+
+        # State
+        self.daily_pnl:       float = 0.0
+        self._trade_pnls:     deque = deque(maxlen=1000)   # timestamped P&Ls
+        self._trade_times:    deque = deque(maxlen=1000)   # corresponding UTC timestamps
+        self._consecutive:    int   = 0
+        self._streak_halted_until: Optional[datetime] = None
+        self._minute_returns: deque = deque(maxlen=72 * 60)  # 72-hour baseline window
+
+    def reset_for_new_utc_day(self) -> None:
+        """Reset daily P&L counter at UTC midnight (called by before_market_opens)."""
+        self.daily_pnl = 0.0
+        logger.info("CryptoCitruitBreaker: daily P&L counter reset.")
+
+    def record_trade(self, pnl: float, is_win: bool) -> None:
+        """Record a completed trade for rolling P&L and streak tracking.
+
+        Args:
+            pnl:    Realised P&L in USD.
+            is_win: True if the trade was profitable.
+        """
+        now = datetime.now(timezone.utc)
+        self._trade_pnls.append(pnl)
+        self._trade_times.append(now)
+        self.daily_pnl += pnl
+
+        if is_win:
+            self._consecutive = 0
+        else:
+            self._consecutive += 1
+            if self._consecutive >= self.consecutive_loss_halt:
+                self._streak_halted_until = now + timedelta(minutes=self.cooldown_minutes)
+                logger.warning(
+                    "CryptoCitruitBreaker: %d consecutive losses — halting for %d min.",
+                    self._consecutive,
+                    self.cooldown_minutes,
+                )
+
+    def record_bar_return(self, log_return: float) -> None:
+        """Record a per-bar log return for ATR-spike detection.
+
+        Call this every on_trading_iteration with the latest BTC bar return.
+        """
+        self._minute_returns.append(abs(log_return))
+
+    def is_trading_halted(self) -> tuple:
+        """Check all three halt conditions.
+
+        Returns:
+            (halted: bool, reason: str)  — reason is empty string if not halted.
+        """
+        now = datetime.now(timezone.utc)
+
+        # 1. Streak cooldown
+        if self._streak_halted_until and now < self._streak_halted_until:
+            remaining = int((self._streak_halted_until - now).total_seconds() / 60)
+            return True, f"Consecutive loss streak — cooldown {remaining} min remaining"
+        elif self._streak_halted_until and now >= self._streak_halted_until:
+            self._streak_halted_until = None
+            self._consecutive = 0   # Reset streak after cooldown
+
+        # 2. 24-hour rolling loss gate
+        cutoff = now - timedelta(hours=24)
+        rolling_pnl = sum(
+            pnl
+            for pnl, ts in zip(self._trade_pnls, self._trade_times)
+            if ts >= cutoff
+        )
+        max_loss_usd = -self.max_24h_loss_pct * self.starting_capital
+        if rolling_pnl < max_loss_usd:
+            return True, (
+                f"24h rolling loss ${rolling_pnl:.2f} exceeds "
+                f"limit ${max_loss_usd:.2f} ({self.max_24h_loss_pct*100:.0f}%)"
+            )
+
+        # 3. ATR-spike gate
+        if len(self._minute_returns) >= 72:
+            baseline_atr = float(np.mean(list(self._minute_returns)))
+            if self._minute_returns and self._minute_returns[-1] > (
+                self.volatility_halt_multiplier * baseline_atr
+            ):
+                return True, (
+                    f"ATR spike {self._minute_returns[-1]:.4f} > "
+                    f"{self.volatility_halt_multiplier}× baseline {baseline_atr:.4f}"
+                )
+
+        return False, ""
