@@ -439,7 +439,7 @@ class DeepScalperAgent:
         Args:
             path: File path to the .pth weight file.
         """
-        state_dict = torch.load(path, map_location=self.device)
+        state_dict = torch.load(path, map_location=self.device, weights_only=True)
         self.online_net.load_state_dict(state_dict)
         self.target_net.load_state_dict(state_dict)
         self.online_net.eval()
