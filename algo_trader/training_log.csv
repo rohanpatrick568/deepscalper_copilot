@@ -1,0 +1,9 @@
+symbol,best_val_sharpe,test_sharpe,max_drawdown_pct,win_rate_pct,avg_trade_duration,gate_passed,batch_size,repeat_times,horizon_len,prefill_steps
+AAPL,33.3672,5.5026,2.89,30.7,3.1,True,64,1.0,128,128
+MSFT,37.9298,-2.5994,7.41,39.0,5.6,False,64,1.0,128,128
+AMZN,36.2507,-4.8097,13.97,35.7,3.8,False,64,1.0,128,128
+NVDA,28.1726,-3.994,13.37,35.5,3.8,False,64,1.0,128,128
+GOOGL,29.5686,-0.4049,14.77,43.5,7.9,False,64,1.0,128,128
+META,33.2955,-0.3554,9.52,36.9,4.8,False,64,1.0,128,128
+TSLA,26.8173,1.8093,2.91,8.7,1.2,True,64,1.0,128,128
+UNH,33.5359,-12.5895,15.45,40.4,7.4,False,64,1.0,128,128
