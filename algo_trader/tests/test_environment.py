@@ -1,9 +1,4 @@
-"""
-tests/test_environment.py — Unit tests for colab/deepscalper/environment.py.
-
-V2 ScalperEnv: Discrete(2) action space, binary LONG/FLAT positions,
-_compute_reward() with hindsight bonus + risk penalty.
-"""
+"""tests/test_environment.py — Unit tests for colab/deepscalper/environment.py."""
 
 import sys
 from pathlib import Path
@@ -13,6 +8,8 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 sys.path.insert(0, str(Path(__file__).parent.parent / "colab"))
+
+from config import LOB_DIM
 
 from deepscalper.environment import ScalperEnv
 
@@ -33,7 +30,7 @@ def _make_env(
 
     close  = 50_000 + np.cumsum(rng.normal(0, 50, n_bars))
     close  = np.maximum(close, 1.0).astype(np.float64)
-    lob    = rng.normal(0, 0.01, (n_bars, 4)).astype(np.float32)
+    lob    = rng.normal(0, 0.01, (n_bars, LOB_DIM)).astype(np.float32)
     macro  = rng.normal(0, 0.01, (n_bars, 11)).astype(np.float32)
     days   = [i * bars_per_day for i in range(n_days)]
 
@@ -55,11 +52,11 @@ def _make_env(
 # ===========================================================================
 
 class TestSpaces:
-    def test_action_space_discrete_2(self):
+    def test_action_space_discrete_3(self):
         env = _make_env()
         from gymnasium import spaces
         assert isinstance(env.action_space, spaces.Discrete)
-        assert int(env.action_space.n) == 2
+        assert int(env.action_space.n) == 3
 
     def test_observation_space_is_dict(self):
         env = _make_env()
@@ -73,7 +70,7 @@ class TestSpaces:
 
     def test_lob_space_shape(self):
         env = _make_env(lookback=10)
-        assert env.observation_space["lob"].shape == (10, 4)
+        assert env.observation_space["lob"].shape == (10, LOB_DIM)
 
     def test_priv_space_shape(self):
         env = _make_env(lookback=10)
@@ -102,7 +99,7 @@ class TestReset:
     def test_lob_shape(self):
         env = _make_env(lookback=10)
         obs, _ = env.reset(seed=0)
-        assert obs["lob"].shape == (10, 4)
+        assert obs["lob"].shape == (10, LOB_DIM)
 
     def test_priv_shape(self):
         env = _make_env(lookback=10)
@@ -189,42 +186,47 @@ class TestStep:
         for key in ("vol_target", "current_price", "position", "log_return"):
             assert key in info
 
-    def test_action_0_from_flat_stays_flat(self):
+    def test_action_1_from_flat_stays_flat(self):
         """FLAT action when already flat → no position change."""
         env = _make_env()
         env.reset(seed=0)
         assert env._position == 0
-        env.step(0)   # FLAT
+        env.step(1)   # FLAT
         assert env._position == 0
 
-    def test_action_1_enters_long(self):
+    def test_action_2_enters_long(self):
         env = _make_env()
         env.reset(seed=0)
-        env.step(1)   # LONG
+        env.step(2)   # LONG
         assert env._position == 1
 
-    def test_action_0_from_long_exits(self):
+    def test_action_1_from_long_exits(self):
         env = _make_env()
         env.reset(seed=0)
-        env.step(1)   # enter LONG
-        env.step(0)   # exit → FLAT
+        env.step(2)   # enter LONG
+        env.step(1)   # exit → FLAT
         assert env._position == 0
 
-    def test_action_1_from_long_stays_long(self):
+    def test_action_2_from_long_stays_long(self):
         env = _make_env()
         env.reset(seed=0)
-        env.step(1)   # enter
-        env.step(1)   # hold
+        env.step(2)   # enter
+        env.step(2)   # hold
         assert env._position == 1
 
-    def test_position_never_negative(self):
-        """V2: short selling is not allowed — position ∈ {0, 1}."""
+    def test_action_0_enters_short(self):
+        env = _make_env()
+        env.reset(seed=0)
+        env.step(0)   # SHORT
+        assert env._position == -1
+
+    def test_position_is_signed_ternary(self):
         env = _make_env()
         obs, _ = env.reset(seed=0)
         for _ in range(30):
             action = env.action_space.sample()
             obs, _, done, _, _ = env.step(action)
-            assert env._position in (0, 1)
+            assert env._position in (-1, 0, 1)
             if done:
                 obs, _ = env.reset(seed=0)
 
@@ -232,8 +234,8 @@ class TestStep:
         """Holding the same position should not incur transaction cost."""
         env = _make_env()
         env.reset(seed=0)
-        env.step(1)        # enter LONG (pay cost once)
-        _, reward_hold, *_ = env.step(1)  # hold LONG (no cost)
+        env.step(2)        # enter LONG (pay cost once)
+        _, reward_hold, *_ = env.step(2)  # hold LONG (no cost)
         # When flat and holding flat, reward should equal the log_return (0 if flat)
         # Simply check finiteness and no extreme value
         assert np.isfinite(reward_hold)
@@ -242,10 +244,10 @@ class TestStep:
         """Changing position should produce a more negative reward vs. holding."""
         env = _make_env()
         env.reset(seed=0)
-        _, reward_enter, *_ = env.step(1)    # flat → long: pays cost
+        _, reward_enter, *_ = env.step(2)    # flat → long: pays cost
         env2 = _make_env()
         env2.reset(seed=0)
-        _, reward_hold, *_ = env2.step(0)    # flat → flat: no cost
+        _, reward_hold, *_ = env2.step(1)    # flat → flat: no cost
         # We can't guarantee absolute comparison because hindsight differs,
         # but entering from flat always pays 0.0025 cost
         pass  # verified structurally; cost is subtracted in environment code
@@ -253,7 +255,7 @@ class TestStep:
     def test_info_position_matches_internal(self):
         env = _make_env()
         env.reset(seed=0)
-        _, _, _, _, info = env.step(1)
+        _, _, _, _, info = env.step(2)
         assert info["position"] == env._position
 
     def test_episode_terminates(self):
@@ -271,7 +273,7 @@ class TestStep:
         obs, _ = env.reset(seed=0)
         for _ in range(10):
             obs, _, done, _, _ = env.step(env.action_space.sample())
-            assert obs["lob"].shape  == (10, 4)
+            assert obs["lob"].shape  == (10, LOB_DIM)
             assert obs["priv"].shape == (10, 2)
             assert obs["macro"].shape == (11,)
             if done:
@@ -337,6 +339,17 @@ class TestComputeReward:
         # hindsight bonus = 0.2 * max(log(55000/50000)) > 0
         assert reward > 0.0
 
+    def test_hindsight_bonus_added_when_short_and_prices_fall(self):
+        env = _make_env()
+        env.reset(seed=0)
+        env._t = 5
+        env._day_end = 20
+        close_copy = env.close_prices.copy()
+        close_copy[5:16] = np.linspace(50_000, 45_000, 11)
+        env.close_prices = close_copy
+        reward = env._compute_reward(0.0, 50_000.0, prev_position=-1)
+        assert reward > 0.0
+
     def test_hindsight_bonus_absent_when_flat(self):
         env = _make_env()
         env.reset(seed=0)
@@ -356,7 +369,7 @@ class TestEdgeCases:
         n = 102
         rng = np.random.default_rng(1)
         close = 50_000 + np.cumsum(rng.normal(0, 10, n)).astype(np.float64)
-        lob   = rng.normal(0, 0.01, (n, 4)).astype(np.float32)
+        lob   = rng.normal(0, 0.01, (n, LOB_DIM)).astype(np.float32)
         macro = rng.normal(0, 0.01, (n, 11)).astype(np.float32)
         days  = [0, 2, 12]   # first day = 2 bars (< lookback+1=11)
         env   = ScalperEnv(
@@ -364,7 +377,7 @@ class TestEdgeCases:
             day_starts=days, lookback_bars=10
         )
         obs, _ = env.reset(seed=99)
-        assert obs["lob"].shape == (10, 4)
+        assert obs["lob"].shape == (10, LOB_DIM)
 
     def test_step_at_day_end_terminates(self):
         env = _make_env()
@@ -378,4 +391,4 @@ class TestEdgeCases:
         env = _make_env()
         for _ in range(100):
             a = env.action_space.sample()
-            assert a in (0, 1)
+            assert a in (0, 1, 2)

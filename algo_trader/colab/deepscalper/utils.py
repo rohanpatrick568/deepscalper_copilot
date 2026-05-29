@@ -8,9 +8,10 @@ Implements the exact feature sets described in the DeepScalper paper (CIKM '22):
         z_open, z_high, z_low, z_close, z_adj_close,
         z_d_5, z_d_10, z_d_15, z_d_20, z_d_25, z_d_30
 
-  compute_micro_features(bars_df, lob_snapshots=None, use_proxy=True) → ndarray (n, LOB_DIM=4)
+  compute_micro_features(bars_df, lob_snapshots=None, use_proxy=True) → ndarray (n, LOB_DIM=5)
       V2 CHANGE: Dual-mode (proxy for training, real LOB for inference).
-      4 microstructure features: spread_pct, order_imbalance, depth_ratio, mid_move_1min
+      5 microstructure features: spread_pct, order_imbalance, depth_ratio,
+      mid_move_1min, micro_volatility
 
   compute_features(bars_df) → ndarray (n, 11)
       Alias for compute_macro_features (backward compatibility).
@@ -31,7 +32,8 @@ import pytz
 logger = logging.getLogger(__name__)
 
 _ET = pytz.timezone("US/Eastern")
-
+
+
 
 # ---------------------------------------------------------------------------
 # Macro features — Table 2 of the paper
@@ -103,7 +105,7 @@ def compute_micro_features(
     lob_snapshots: Optional[pd.DataFrame] = None,
     use_proxy: bool = True,
 ) -> np.ndarray:
-    """Compute 4 microstructure features — dual-mode for training vs. inference.
+    """Compute 5 microstructure features — dual-mode for training vs. inference.
 
     TRAINING MODE (use_proxy=True, default):
         Reconstructs LOB microstructure from OHLCV candlestick data using
@@ -115,11 +117,12 @@ def compute_micro_features(
             bid_price_1, bid_size_1, bid_price_2, bid_size_2, bid_price_3, bid_size_3
             ask_price_1, ask_size_1, ask_price_2, ask_size_2, ask_price_3, ask_size_3
 
-    V2 CHANGE: 5 features → 4 features (matches TradeMaster micro feature count):
+    Feature set (ordered identically in proxy and real-LOB mode):
         0  spread_pct:      Bid-ask spread as % of mid price
         1  order_imbalance: (buy_vol - sell_vol) / total_vol in [-1, 1]
         2  depth_ratio:     bid_depth / ask_depth (log-normalised)
         3  mid_move_1min:   Close pct change clipped to [-5%, +5%]
+        4  micro_volatility: rolling std(mid_move_1min, 5 bars)
 
     IMPORTANT: Feature names and ORDER are identical in both modes so that
     a model trained on proxies can be used directly with real LOB features.
@@ -130,7 +133,7 @@ def compute_micro_features(
         use_proxy: If True, use OHLCV proxy; if False, use lob_snapshots.
 
     Returns:
-        float32 array of shape (len(bars), 4).
+        float32 array of shape (len(bars), 5).
     """
     df = bars.copy()
     df.columns = [c.lower() for c in df.columns]
@@ -167,11 +170,20 @@ def compute_micro_features(
         # 4. Mid-price 1-min return
         mid_move = c.pct_change().fillna(0.0).clip(-0.05, 0.05)
 
+        micro_volatility = (
+            pd.Series(mid_move)
+            .rolling(5, min_periods=1)
+            .std()
+            .fillna(0.0)
+            .clip(0.0, 0.05)
+        )
+
         features = np.column_stack([
             spread_pct.values,
             order_imbalance,
             depth_ratio,
             mid_move.values,
+            micro_volatility.values,
         ]).astype(np.float32)
 
     else:
@@ -211,11 +223,20 @@ def compute_micro_features(
         # 4. Mid-price 1-min return
         mid_move = mid_price.pct_change().fillna(0.0).clip(-0.05, 0.05)
 
+        micro_volatility = (
+            pd.Series(mid_move)
+            .rolling(5, min_periods=1)
+            .std()
+            .fillna(0.0)
+            .clip(0.0, 0.05)
+        )
+
         features = np.column_stack([
             spread_pct.values,
             order_imbalance.values,
             depth_ratio.values,
             mid_move.values,
+            micro_volatility.values,
         ]).astype(np.float32)
 
     return np.nan_to_num(features, nan=0.0, posinf=0.05, neginf=-0.05)

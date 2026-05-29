@@ -12,7 +12,6 @@ Automatically scrolls to the newest entry.  Retains at most
 MAX_TRADE_LOG_ENTRIES lines (FIFO eviction).
 """
 
-from PyQt5.QtCore import Qt
 from PyQt5.QtGui import QColor, QFont, QTextCharFormat, QTextCursor
 from PyQt5.QtWidgets import (
     QHBoxLayout,

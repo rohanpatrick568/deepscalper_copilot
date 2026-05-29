@@ -3,8 +3,8 @@ execution/state_builder.py — Live Bar Data → DeepScalper Observation Dict.
 
 Bridge between Lumibot's live bar DataFrame and the DeepScalperNet model.
 
-Returns a dict observation matching the format expected by the network:
-    'lob'   : torch.FloatTensor  shape (1, seq_len, LOB_DIM=4)   — micro features
+    Returns a dict observation matching the format expected by the network:
+    'lob'   : torch.FloatTensor  shape (1, seq_len, LOB_DIM=5)   — micro features
     'priv'  : torch.FloatTensor  shape (1, seq_len, PRIV_DIM=2)  — private state
     'macro' : torch.FloatTensor  shape (1, MACRO_DIM=11)          — macro features
 
@@ -25,7 +25,7 @@ from typing import Optional
 import numpy as np
 import torch
 
-from config import LOOKBACK_BARS, MACRO_DIM, LOB_DIM, PRIV_DIM
+from config import LOOKBACK_BARS, MACRO_DIM, LOB_DIM
 from colab.deepscalper.utils import compute_macro_features, compute_micro_features
 
 logger = logging.getLogger(__name__)
@@ -43,7 +43,7 @@ def build_observation(
     Args:
         bars               : pandas DataFrame with OHLCV columns and DatetimeIndex.
                              Must have at least LOOKBACK_BARS rows.
-        position           : Current position flag: 1 long, 0 flat.
+        position           : Current position flag: -1 short, 0 flat, +1 long.
         unrealized_pnl_pct : Unrealized P&L as a fraction of notional.
         lob_override       : Optional micro-feature override array with shape
                      (n, LOB_DIM) or (1, LOB_DIM). Used by live strategy
@@ -89,7 +89,7 @@ def build_observation(
 
     # ---- Private state sequence ----
     # For live inference we only have the current state; replicate it across the window.
-    pos_flag  = 1.0 if position != 0 else 0.0
+    pos_flag  = float(np.clip(position, -1, 1))
     pnl_clamp = float(np.clip(unrealized_pnl_pct, -0.5, 0.5))
     priv_vec  = np.array([pos_flag, pnl_clamp], dtype=np.float32)
     priv_seq  = np.tile(priv_vec, (seq_len, 1))   # (seq_len, 2)

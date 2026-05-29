@@ -11,6 +11,7 @@ import os
 from pathlib import Path
 
 from dotenv import load_dotenv
+from tickers import SP100_TICKERS
 
 # Load environment variables from a .env file located at the project root.
 load_dotenv(dotenv_path=Path(__file__).parent / ".env")
@@ -23,46 +24,68 @@ ALPACA_SECRET_KEY: str = os.getenv("ALPACA_SECRET_KEY", "")
 ALPACA_BASE_URL: str = "https://paper-api.alpaca.markets"   # Paper trading endpoint
 ALPACA_DATA_URL: str = "https://data.alpaca.markets"        # Data API v2
 
+# Lumibot reads generic broker credential names during import, so mirror the
+# Alpaca values into those keys for compatibility.
+os.environ["API_KEY"] = ALPACA_API_KEY
+os.environ["API_SECRET"] = ALPACA_SECRET_KEY
+os.environ["ALPACA_API_KEY"] = ALPACA_API_KEY
+os.environ["ALPACA_API_SECRET"] = ALPACA_SECRET_KEY
+os.environ["MARKET"] = "NYSE"
+
 # ---------------------------------------------------------------------------
 # Trading Universe
 # ---------------------------------------------------------------------------
 # Imported lazily by other modules via tickers.py to avoid circular imports.
 # Reproduced here as a reference; the canonical list lives in tickers.py.
-from tickers import SP100_TICKERS  # noqa: E402  (kept for legacy equity strategy)
 
-# V2 CHANGE: Crypto universe — BTC/USD only for v2 (expand after Sharpe > 0.5 proven)
-CRYPTO_PAIRS: list = ['BTC/USD']           # Single pair for v2
-TRADING_UNIVERSE: list = CRYPTO_PAIRS      # Replaces SP100_TICKERS in crypto mode
+# Equity rollout universe (pilot subset for safer staged deployment)
+TRADING_UNIVERSE: list = SP100_TICKERS[:10]
+CRYPTO_PAIRS: list = []  # Backward-compat alias (deprecated)
 
 # ---------------------------------------------------------------------------
 # Execution Parameters
 # ---------------------------------------------------------------------------
 CANDLE_TIMEFRAME: str = "1Min"   # Lumibot timestep identifier
-LOOKBACK_BARS: int = 10          # V2 CHANGE: 60 → 10 (TradeMaster: backward_num_day=5)
+LOOKBACK_BARS: int = 60          # Paper-aligned observation lookback
 SLEEP_TIME: str = "1M"           # Lumibot on_trading_iteration frequency
 
 # ---------------------------------------------------------------------------
 # Risk Management
 # ---------------------------------------------------------------------------
-STARTING_CAPITAL: float = 5_000.00    # Paper trading account size (USD)
+STARTING_CAPITAL: float = 1_000.00    # Paper trading account size (USD)
 KELLY_FRACTION: float = 0.5           # Fractional Kelly coefficient (half-Kelly for safety)
 ATR_PERIOD: int = 14                  # Periods for ATR calculation
 ATR_STOP_MULTIPLIER: float = 2.0      # Stop-loss = entry ± (ATR × multiplier)
 ATR_TP_MULTIPLIER: float = 4.0        # Take-profit = entry ± (ATR × TP multiplier)
-MAX_POSITION_PCT: float = 0.95        # V2 CHANGE: 0.03 → 0.95 (single pair; Kelly sizes within)
+MAX_POSITION_PCT: float = 0.03        # Paper-aligned max position cap
+
+# Trade frequency and exit control (live execution)
+MIN_HOLD_BARS: int = 3                # Minimum bars to hold after entry before model-driven exit
+ENTRY_COOLDOWN_BARS: int = 2          # Bars to wait after exit before allowing a new entry
+
+# Trailing/volatility exits
+USE_TRAILING_STOP: bool = True
+TRAILING_ATR_MULTIPLIER: float = 1.5  # Trail distance = max(ATR*x, floor% of price)
+TRAILING_STOP_FLOOR_PCT: float = 0.003  # 30 bps minimum trailing distance
+
+# Volatility-scaled sizing
+USE_VOLATILITY_SIZING: bool = True
+TARGET_ENTRY_RISK_PCT: float = 0.005  # Target stop distance as fraction of price (50 bps)
+MIN_POSITION_SCALE: float = 0.30
+MAX_POSITION_SCALE: float = 1.00
 
 # ---------------------------------------------------------------------------
 # Circuit Breakers
 # ---------------------------------------------------------------------------
-MAX_DAILY_LOSS_PCT: float = 0.05      # V2 CHANGE: 0.03 → 0.05 (crypto more volatile; 24hr rolling)
-NO_TRADE_OPEN_BUFFER_MIN = None       # V2 CHANGE: Not applicable — crypto is 24/7
-NO_TRADE_CLOSE_BUFFER_MIN = None      # V2 CHANGE: Not applicable — crypto is 24/7
-CLOSE_ALL_EOD: bool = False           # V2 CHANGE: No end-of-day in crypto
-EOD_CLOSE_BUFFER_MIN: int = 5         # Kept for legacy equity strategy compatibility
+MAX_DAILY_LOSS_PCT: float = 0.03      # Daily loss halt threshold
+NO_TRADE_OPEN_BUFFER_MIN: int = 15    # No entries in first 15 min after open
+NO_TRADE_CLOSE_BUFFER_MIN: int = 15   # No new entries in last 15 min before close
+CLOSE_ALL_EOD: bool = True            # Force-flat by market close
+EOD_CLOSE_BUFFER_MIN: int = 5         # Close all positions 5 min before close
 
-# V2 CHANGE: Crypto-specific circuit breakers
-VOLATILITY_HALT_MULTIPLIER: float = 4.0  # Halt if 5-min ATR > 4× its 72-hr rolling avg (flash crash)
-CONSECUTIVE_LOSS_HALT: int = 8           # Halt 30 min after 8 consecutive losing trades
+# Legacy crypto-only breakers retained for compatibility but not used in equities mode
+VOLATILITY_HALT_MULTIPLIER: float = 4.0
+CONSECUTIVE_LOSS_HALT: int = 8
 
 # Market session constants (US Eastern Time — kept for legacy equity strategy)
 MARKET_OPEN_HOUR: int = 9
@@ -78,17 +101,17 @@ WEIGHTS_DIR: Path = Path("./weights/")   # Local directory containing .pth weigh
 
 # --- Observation dimensions ---
 MACRO_DIM: int = 11    # Macro features: z_open/high/low/close/adj + z_d_5..30 (Table 2)
-LOB_DIM: int = 4       # V2 CHANGE: 5 → 4 (new dual-mode micro features: spread/imbalance/depth/mid_move)
+LOB_DIM: int = 5       # Paper-aligned micro feature schema width
 PRIV_DIM: int = 2      # Private state: (position_flag, unrealised_pnl_pct)
 
 # Legacy alias kept for backward compatibility
 INPUT_DIM: int = MACRO_DIM  # = 11
 
 # --- Action space (Branching Dueling Q-Network) ---
-# V2 CHANGE: Binary LONG/FLAT only — Alpaca crypto has no short selling
-N_DIR: int = 2         # V2 CHANGE: 3 → 2. Direction branch: 0=FLAT, 1=LONG
-N_SIZE: int = 1        # V2 CHANGE: 4 → 1. Size determined externally by Kelly Criterion
-ACTION_DIM: int = 2   # V2 CHANGE: Binary action — 0=FLAT, 1=LONG
+# Paper-aligned direction/size branches
+N_DIR: int = 3         # Direction branch: 0=SHORT, 1=FLAT, 2=LONG
+N_SIZE: int = 4        # Size branch cardinality
+ACTION_DIM: int = 3    # Discrete action semantics: SHORT/FLAT/LONG
 
 # --- Encoder dimensions ---
 GRU_HIDDEN: int = 128        # GRU hidden size per stream in MicroEncoder
@@ -101,37 +124,51 @@ FC_SIZE: int = FC_HIDDEN
 DROPOUT_RATE: float = 0.0    # Paper does not specify dropout; set to 0
 
 # --- Hindsight bonus (Section 4.2) ---
-HINDSIGHT_HORIZON: int = 10    # V2 CHANGE: 60 → 10 (TradeMaster: forward_num_day=5 bars)
-HINDSIGHT_WEIGHT: float = 0.2  # V2 CHANGE: 0.01 → 0.2 (TradeMaster: future_weights=0.2)
+HINDSIGHT_HORIZON: int = 60    # Paper-aligned forward horizon
+HINDSIGHT_WEIGHT: float = 0.2  # TradeMaster-aligned coaching weight
 
 # --- Risk-aware auxiliary task (Section 4.4) ---
 AUX_TASK_ETA: float = 1.0    # η: relative importance of volatility prediction loss
 
-# --- Training hyperparameters (reference values — used in Colab notebooks) ---
-LEARNING_RATE: float = 3e-4
+# --- TradeMaster DeepScalper canonical hyperparameters ---
+# Source: configs/algorithmic_trading/algorithmic_trading_BTC_deepscalper_deepscalper_adam_mse.py
+EPOCHS: int = 20
 BATCH_SIZE: int = 64
-REPLAY_BUFFER_CAPACITY: int = 50_000
-TARGET_UPDATE_FREQ: int = 100             # Soft-update target network every N steps
-TAU: float = 0.01                         # Soft-update coefficient
-EPSILON_START: float = 1.0
-EPSILON_END: float = 0.01
-EPSILON_DECAY_STEPS: int = 10_000
-MIN_EPISODES: int = 200
-EARLY_STOP_PATIENCE: int = 20             # Episodes without val Sharpe improvement
-PER_ALPHA: float = 0.6                    # Prioritized replay priority exponent
-PER_BETA_START: float = 0.4              # IS weight annealing start value
-TRANSACTION_COST_LAMBDA: float = 0.0025  # V2 CHANGE: 0.0001 → 0.0025 (Alpaca crypto taker fee: 25 bps)
+HORIZON_LEN: int = 128
+BUFFER_SIZE: int = 1_000_000
+
+LEARNING_RATE: float = 1e-3
+GAMMA: float = 0.9
+REPEAT_TIMES: float = 1.0
+CLIP_GRAD_NORM: float = 3.0
+SOFT_UPDATE_TAU: float = 0.0
+STATE_VALUE_TAU: float = 0.005
+EXPLORE_RATE: float = 0.25
+
+# TradeMaster-equivalent environment defaults used by notebooks/backtests.
+TRANSACTION_COST_LAMBDA: float = 0.001
+
+# Compatibility aliases for legacy local code paths (deprecated).
+REPLAY_BUFFER_CAPACITY: int = BUFFER_SIZE
+TARGET_UPDATE_FREQ: int = 1
+TAU: float = SOFT_UPDATE_TAU
+EPSILON_START: float = EXPLORE_RATE
+EPSILON_END: float = EXPLORE_RATE
+EPSILON_DECAY_STEPS: int = 1
+MIN_EPISODES: int = EPOCHS
+EARLY_STOP_PATIENCE: int = EPOCHS
+PER_ALPHA: float = 0.6
+PER_BETA_START: float = 0.4
 
 # V2 CHANGE: TradeMaster train/val/test split (time-ordered, no shuffling)
 TRAIN_SPLIT: float = 0.70    # 70% training
 VAL_SPLIT: float   = 0.10    # 10% validation (model selection)
 TEST_SPLIT: float  = 0.20    # 20% test (final evaluation — never used for model selection)
 
-# V2 CHANGE: LOB feature config
-LOB_LEVELS: int = 3                        # Use top 3 bid/ask levels from Alpaca orderbook
-USE_REAL_LOB_INFERENCE: bool = True        # Use real Alpaca orderbook during live inference
-USE_PROXY_LOB_TRAINING: bool = True        # Use OHLCV-proxy features during training
-                                           # (real historical LOB data not available for 6mo)
+# LOB feature config
+LOB_LEVELS: int = 3
+USE_REAL_LOB_INFERENCE: bool = False       # Equities path defaults to proxy-micro features
+USE_PROXY_LOB_TRAINING: bool = True
 
 # ---------------------------------------------------------------------------
 # Dashboard

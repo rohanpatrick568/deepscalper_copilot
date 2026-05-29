@@ -25,6 +25,7 @@ logger = logging.getLogger(__name__)
 ALPACA_CONFIG: dict = {
     "API_KEY": ALPACA_API_KEY,
     "API_SECRET": ALPACA_SECRET_KEY,
+    "MARKET": "NYSE",
     "PAPER": True,   # Always True — this system is paper-trading only
 }
 

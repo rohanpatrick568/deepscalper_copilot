@@ -1,49 +1,55 @@
-# weights/
+# weights Directory
 
-This directory contains V2 DeepScalper model weights for crypto trading.
+This directory stores trained DeepScalper checkpoint files for the configured equities universe.
 
-## Expected Files (V2)
+## Naming Convention
 
-V2 uses a BTC/USD-only universe by default, so the expected primary file is:
+One checkpoint per symbol:
 
-```
-BTC_USD.pth
-```
-
-If the configured universe is expanded later, each pair should use the same naming pattern:
-
-```
-{PAIR_WITH_SLASH_REPLACED_BY_UNDERSCORE}.pth
+```text
+{SYMBOL}.pth
 ```
 
 Examples:
 
-```
-BTC_USD.pth
-ETH_USD.pth
-```
-
-## Verify Weights
-
-```bash
-python -c "
-from pathlib import Path
-from config import CRYPTO_PAIRS
-missing = [p for p in CRYPTO_PAIRS if not (Path('weights') / f'{p.replace('/', '_')}.pth').exists()]
-print(f'Missing: {missing}' if missing else 'All crypto weight files present.')
-"
+```text
+AAPL.pth
+MSFT.pth
+NVDA.pth
 ```
 
-## Model Architecture
+If any symbol contains a slash in future extensions, loaders normalize with symbol.replace("/", "_").
 
-Each `.pth` file contains a `state_dict` for `DeepScalperNet` trained with V2 dimensions:
+## Expected Checkpoint Layout
 
-- `MACRO_DIM = 11`
-- `LOB_DIM = 4`
-- `N_DIR = 2` (FLAT/LONG)
-- `N_SIZE = 1`
+Both layouts are supported by loaders:
 
-Load example:
+1. Wrapped checkpoint with online_net key
+2. Raw state_dict checkpoint
+
+Loaders use:
+
+```python
+state_dict = ckpt.get("online_net", ckpt)
+```
+
+## Current Model Signature
+
+DeepScalperNet forward returns:
+
+- q_dir
+- q_size
+
+The old auxiliary volatility output is no longer part of the active model forward path.
+
+## Verify Required Weight Files
+
+```powershell
+cd algo_trader
+python -c "from pathlib import Path; from config import TRADING_UNIVERSE, WEIGHTS_DIR; missing=[s for s in TRADING_UNIVERSE if not (WEIGHTS_DIR / f'{s.replace('/', '_')}.pth').exists()]; print('Missing:'+','.join(missing) if missing else 'All required weight files present.')"
+```
+
+## Minimal Load Example
 
 ```python
 import torch
@@ -51,26 +57,25 @@ from colab.deepscalper.architecture import DeepScalperNet
 from config import MACRO_DIM, LOB_DIM, PRIV_DIM, GRU_HIDDEN, MACRO_EMBED_DIM, FC_HIDDEN, N_DIR, N_SIZE
 
 model = DeepScalperNet(
-	macro_dim=MACRO_DIM,
-	lob_dim=LOB_DIM,
-	priv_dim=PRIV_DIM,
-	gru_hidden=GRU_HIDDEN,
-	macro_embed=MACRO_EMBED_DIM,
-	fc_hidden=FC_HIDDEN,
-	n_dir=N_DIR,
-	n_size=N_SIZE,
+    macro_dim=MACRO_DIM,
+    lob_dim=LOB_DIM,
+    priv_dim=PRIV_DIM,
+    gru_hidden=GRU_HIDDEN,
+    macro_embed=MACRO_EMBED_DIM,
+    fc_hidden=FC_HIDDEN,
+    n_dir=N_DIR,
+    n_size=N_SIZE,
 )
-state = torch.load("weights/BTC_USD.pth", map_location="cpu")
-state_dict = state.get("online_net", state)
+
+ckpt = torch.load("weights/AAPL.pth", map_location="cpu", weights_only=True)
+state_dict = ckpt.get("online_net", ckpt)
 model.load_state_dict(state_dict)
 model.eval()
 ```
 
-## Retraining Pipeline
+## How Weights Are Produced
 
-Run notebooks in order:
+Primary training/export flow:
 
-1. `colab/01_fetch_training_data.ipynb`
-2. `colab/02_feature_engineering.ipynb`
-3. `colab/03_train_deepscalper.ipynb`
-4. `colab/04_export_and_push_weights.ipynb`
+1. colab/03_train_deepscalper.ipynb
+2. colab/04_export_and_push_weights.ipynb

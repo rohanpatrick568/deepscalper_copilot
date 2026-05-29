@@ -20,7 +20,7 @@ Threading note:
 import logging
 
 from PyQt5.QtCore import Qt, QTimer
-from PyQt5.QtGui import QFont, QIcon
+from PyQt5.QtGui import QFont
 from PyQt5.QtWidgets import (
     QMainWindow,
     QSplitter,

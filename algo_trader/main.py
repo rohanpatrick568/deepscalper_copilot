@@ -3,7 +3,7 @@ main.py — AlgoTrader System Entry Point.
 
 Starts the complete DeepScalper × Alpaca paper trading system:
   1. Validates environment (.env) and credentials.
-    2. Verifies all configured crypto weight files exist in ./weights/.
+        2. Verifies all configured equity weight files exist in ./weights/.
   3. Starts Lumibot trading engine in a background daemon thread.
   4. Starts PyQt5 dashboard in the main thread (required by Qt).
 
@@ -46,7 +46,7 @@ def _validate_environment() -> None:
     Raises:
         SystemExit: On any validation failure.
     """
-    from config import ALPACA_API_KEY, ALPACA_SECRET_KEY, CRYPTO_PAIRS, WEIGHTS_DIR
+    from config import ALPACA_API_KEY, ALPACA_SECRET_KEY, TRADING_UNIVERSE, WEIGHTS_DIR
 
     # 1. Credentials check
     if not ALPACA_API_KEY or not ALPACA_SECRET_KEY:
@@ -70,11 +70,11 @@ def _validate_environment() -> None:
         logger.critical("Alpaca credential verification failed: %s — aborting.", exc)
         sys.exit(1)
 
-    # 3. Weight files check (V2: one file per configured crypto pair)
+    # 3. Weight files check (one file per configured symbol)
     missing = [
-        pair
-        for pair in CRYPTO_PAIRS
-        if not (WEIGHTS_DIR / f"{pair.replace('/', '_')}.pth").exists()
+        symbol
+        for symbol in TRADING_UNIVERSE
+        if not (WEIGHTS_DIR / f"{symbol.replace('/', '_')}.pth").exists()
     ]
     if missing:
         logger.critical(
@@ -86,7 +86,7 @@ def _validate_environment() -> None:
         )
         sys.exit(1)
 
-    logger.info("All %d crypto weight file(s) verified ✓", len(CRYPTO_PAIRS))
+    logger.info("All %d symbol weight file(s) verified ✓", len(TRADING_UNIVERSE))
 
 
 def _run_lumibot(bridge) -> None:
@@ -98,17 +98,17 @@ def _run_lumibot(bridge) -> None:
     try:
         from config import ALPACA_API_KEY, ALPACA_SECRET_KEY
         from execution.broker import get_broker
-        from execution.strategy import CryptoDeepScalper
+        from execution.strategy import EquityDeepScalper
 
         broker = get_broker()
-        strategy = CryptoDeepScalper(
+        strategy = EquityDeepScalper(
             broker=broker,
             data_bridge=bridge,
             alpaca_api_key=ALPACA_API_KEY,
             alpaca_secret_key=ALPACA_SECRET_KEY,
         )
         logger.info("Starting Lumibot trading engine…")
-        strategy.run_all()
+        strategy.run_live()
     except Exception:
         logger.exception("Lumibot thread encountered an unhandled exception:")
 
@@ -123,7 +123,7 @@ def _run_dashboard(bridge) -> None:
     from dashboard.main_window import MainWindow
 
     app = QApplication(sys.argv)
-    window = MainWindow(bridge=bridge)
+    window = MainWindow(data_bridge=bridge)
     window.show()
     logger.info("Dashboard window opened.")
     exit_code = app.exec_()
@@ -146,6 +146,10 @@ def main() -> None:
     bridge.portfolio_value = STARTING_CAPITAL
     logger.info("DataBridge initialised with starting capital $%.2f.", STARTING_CAPITAL)
 
+    # Warm up PyTorch on the main thread so the Lumibot worker can reuse the
+    # already-loaded DLLs instead of initializing them inside the thread.
+    import torch  # noqa: F401
+
     # Start Lumibot in a daemon background thread
     lumibot_thread = threading.Thread(
         target=_run_lumibot,
@@ -159,9 +163,20 @@ def main() -> None:
     # Give Lumibot a moment to connect before the dashboard appears
     time.sleep(2)
 
-    # Qt event loop runs in main thread (required by PyQt5)
+    headless_mode = os.getenv("ALGO_TRADER_HEADLESS", "0").strip().lower() in {
+        "1", "true", "yes", "y", "on"
+    }
+
+    # Qt event loop runs in main thread (required by PyQt5).
+    # In headless mode we keep the process alive while Lumibot runs.
     try:
-        exit_code = _run_dashboard(bridge)
+        if headless_mode:
+            logger.info("Headless mode enabled (ALGO_TRADER_HEADLESS=1); dashboard is disabled.")
+            while lumibot_thread.is_alive():
+                time.sleep(1)
+            exit_code = 0
+        else:
+            exit_code = _run_dashboard(bridge)
     except KeyboardInterrupt:
         logger.info("KeyboardInterrupt received — shutting down.")
         exit_code = 0

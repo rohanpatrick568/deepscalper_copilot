@@ -12,7 +12,6 @@ from pathlib import Path
 from datetime import time as dtime
 from unittest.mock import patch
 
-import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
@@ -32,8 +31,7 @@ def _make_cb(max_daily_loss_pct: float = 0.03, starting_capital: float = 10_000.
 
 def _patch_time(cb: CircuitBreaker, hour: int, minute: int):
     """Context manager: patch _current_et_time to return a fixed time."""
-    import execution.circuit_breakers as _mod
-    return patch.object(cb, "_current_et_time", return_value=dtime(hour, minute))
+    return patch("execution.circuit_breakers._current_et_time", return_value=dtime(hour, minute))
 
 
 # ---------------------------------------------------------------------------

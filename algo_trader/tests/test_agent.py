@@ -8,7 +8,6 @@ Covers:
 """
 
 import sys
-import tempfile
 from pathlib import Path
 
 import numpy as np
@@ -17,6 +16,8 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 sys.path.insert(0, str(Path(__file__).parent.parent / "colab"))
+
+from config import LOB_DIM, N_DIR, N_SIZE
 
 from deepscalper.agent import (
     DeepScalperAgent,
@@ -29,7 +30,7 @@ from deepscalper.agent import (
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _make_obs(seq: int = 10, lob_dim: int = 4, priv_dim: int = 2, macro_dim: int = 11):
+def _make_obs(seq: int = 10, lob_dim: int = LOB_DIM, priv_dim: int = 2, macro_dim: int = 11):
     """Create a random obs dict (numpy arrays, no batch dim)."""
     rng = np.random.default_rng(0)
     return {
@@ -39,16 +40,17 @@ def _make_obs(seq: int = 10, lob_dim: int = 4, priv_dim: int = 2, macro_dim: int
     }
 
 
-def _make_agent(n_dir: int = 2, lob_dim: int = 4, buffer_capacity: int = 500) -> DeepScalperAgent:
+def _make_agent(n_dir: int = N_DIR, lob_dim: int = LOB_DIM, buffer_capacity: int = 500) -> DeepScalperAgent:
     """Small V2-like agent for fast tests."""
     return DeepScalperAgent(
         macro_dim=11, lob_dim=lob_dim, priv_dim=2,
-        n_dir=n_dir, n_size=1,
+        n_dir=n_dir, n_size=N_SIZE,
         gru_hidden=16, macro_embed=8, fc_hidden=16,
-        lr=1e-3, gamma=0.99, tau=0.01,
+        lr=1e-3, gamma=0.9, soft_update_tau=0.0,
+        repeat_times=1.0, clip_grad_norm=3.0,
         batch_size=8,
         buffer_capacity=buffer_capacity,
-        epsilon_start=1.0, epsilon_end=0.05, epsilon_decay=1000,
+        explore_rate=0.25,
         device="cpu",
     )
 
@@ -147,7 +149,7 @@ class TestPrioritizedReplayBuffer:
         buf = self._make_buf()
         self._push_n(buf, 20)
         batch, _, _ = buf.sample(8, device="cpu")
-        assert batch["lob"].shape == (8, 10, 4)   # seq=10, lob_dim=4
+        assert batch["lob"].shape == (8, 10, LOB_DIM)
 
     def test_sample_rewards_tensor(self):
         buf = self._make_buf()
@@ -199,9 +201,9 @@ class TestAgentConstructor:
         for op, tp in zip(agent.online_net.parameters(), agent.target_net.parameters()):
             assert torch.allclose(op, tp)
 
-    def test_epsilon_start(self):
+    def test_explore_rate_default(self):
         agent = _make_agent()
-        assert agent.epsilon == pytest.approx(1.0)
+        assert agent.explore_rate == pytest.approx(0.25)
 
     def test_buffer_empty_at_init(self):
         agent = _make_agent()
@@ -214,7 +216,7 @@ class TestAgentConstructor:
 
 class TestSelectAction:
     def test_returns_tuple_of_two_ints(self):
-        agent = _make_agent(n_dir=2)
+        agent = _make_agent(n_dir=N_DIR)
         obs   = _make_obs()
         result = agent.select_action(obs)
         assert isinstance(result, tuple)
@@ -222,59 +224,58 @@ class TestSelectAction:
         assert isinstance(result[0], int)
         assert isinstance(result[1], int)
 
-    def test_dir_action_in_range_v2(self):
-        """V2: dir_action must be in {0, 1} (N_DIR=2)."""
-        agent = _make_agent(n_dir=2)
+    def test_dir_action_in_range(self):
+        agent = _make_agent(n_dir=N_DIR)
         obs   = _make_obs()
         for _ in range(50):
             dir_act, _ = agent.select_action(obs)
-            assert dir_act in (0, 1), f"dir_act={dir_act} out of range"
+            assert 0 <= dir_act < N_DIR, f"dir_act={dir_act} out of range"
 
     def test_size_action_in_range(self):
-        agent = _make_agent(n_dir=2)
+        agent = _make_agent(n_dir=N_DIR)
         obs   = _make_obs()
         for _ in range(50):
             _, size_act = agent.select_action(obs)
-            assert size_act == 0   # n_size=1, only action is index 0
+            assert 0 <= size_act < N_SIZE
 
-    def test_high_epsilon_is_random(self):
-        """With ε=1.0, actions should vary over many samples."""
-        agent = _make_agent(n_dir=2)
+    def test_high_explore_rate_is_random(self):
+        """With explore_rate=1.0, actions should vary over many samples."""
+        agent = _make_agent(n_dir=N_DIR)
+        agent.explore_rate = 1.0
         agent.epsilon = 1.0
         obs   = _make_obs()
         actions = set()
         for _ in range(100):
             dir_act, _ = agent.select_action(obs)
             actions.add(dir_act)
-        # Over 100 tries with N_DIR=2, both should appear
-        assert len(actions) == 2
+        # Over 100 tries with N_DIR=3, at least two actions should appear.
+        assert len(actions) >= 2
 
-    def test_zero_epsilon_greedy(self):
-        """With ε≈0, the same obs should always return the same action."""
-        agent = _make_agent(n_dir=2)
+    def test_zero_explore_rate_is_greedy(self):
+        """With explore_rate=0, the same obs should always return the same action."""
+        agent = _make_agent(n_dir=N_DIR)
+        agent.explore_rate = 0.0
         agent.epsilon = 0.0
-        agent.epsilon_end = 0.0  # floor also 0 so decay doesn't snap it back
         obs = _make_obs()
         dir_acts = {agent.select_action(obs)[0] for _ in range(20)}
         # Greedy policy must be deterministic
         assert len(dir_acts) == 1
 
-    def test_epsilon_decays_over_steps(self):
-        agent = _make_agent(n_dir=2)
-        eps_before = agent.epsilon
+    def test_explore_rate_remains_static_over_steps(self):
+        agent = _make_agent(n_dir=N_DIR)
+        rate_before = agent.explore_rate
         obs = _make_obs()
         for _ in range(100):
             agent.select_action(obs)
-        assert agent.epsilon <= eps_before
+        assert agent.explore_rate == pytest.approx(rate_before)
 
-    def test_epsilon_never_below_epsilon_end(self):
-        # epsilon_decay=1000, so epsilon floors after ~1000 steps.
-        # Run 1500 to confirm it stays bounded; avoids 100k PyTorch fwd passes.
-        agent = _make_agent(n_dir=2)
+    def test_epsilon_alias_tracks_explore_rate(self):
+        agent = _make_agent(n_dir=N_DIR)
+        agent.explore_rate = 0.17
         obs = _make_obs()
-        for _ in range(1_500):
+        for _ in range(10):
             agent.select_action(obs)
-        assert agent.epsilon >= agent.epsilon_end - 1e-9
+        assert agent.epsilon == pytest.approx(agent.explore_rate)
 
 
 # ===========================================================================
@@ -330,8 +331,9 @@ class TestSaveLoad:
         for p1, p2 in zip(agent.online_net.parameters(), agent2.online_net.parameters()):
             assert torch.allclose(p1, p2)
 
-    def test_epsilon_restored(self, tmp_path):
+    def test_explore_rate_restored(self, tmp_path):
         agent = _make_agent()
+        agent.explore_rate = 0.42
         agent.epsilon = 0.42
         agent._steps  = 999
         path = str(tmp_path / "agent.pt")
@@ -339,7 +341,7 @@ class TestSaveLoad:
 
         agent2 = _make_agent()
         agent2.load(path)
-        assert agent2.epsilon == pytest.approx(0.42)
+        assert agent2.explore_rate == pytest.approx(0.42)
 
     def test_load_nonexistent_raises(self):
         agent = _make_agent()

@@ -28,21 +28,16 @@ Four building blocks (Figure 3):
       During inference : a_dir  = argmax Q_dir,  a_size = argmax Q_size
       BDQ loss         : (1/2) Σ_{d∈{dir,size}} E[(y_d − Q_d)²]   (IS-weighted)
 
-  (d) VolatilityHead  — Single Linear layer for the risk-aware auxiliary task.
-                        Input  : market_embedding
-                        Output : predicted realised volatility  shape (B, 1)
-                        Loss   : L_vol = (y_vol − ŷ_vol)²
-
-  Total loss: L = L_q + η × L_vol
+    (d) TradeMaster parity path uses Q-value heads only (no auxiliary vol head).
 
 Observation split (must match environment.py / state_builder.py):
-    lob   : (B, seq_len, LOB_DIM=4)   — microstructure sequence
+    lob   : (B, seq_len, LOB_DIM=5)   — microstructure sequence
   priv  : (B, seq_len, PRIV_DIM=2)  — private-state sequence (position, P&L)
   macro : (B, MACRO_DIM=11)         — current-bar macro features (no time dim)
 
 Action space (BDQ):
-    direction : N_DIR=2    (0=FLAT, 1=LONG)
-    size      : N_SIZE=1   (single size branch retained for interface compatibility)
+    direction : N_DIR=3    (0=SHORT, 1=FLAT, 2=LONG)
+    size      : N_SIZE=4
 """
 
 import torch
@@ -50,10 +45,10 @@ import torch.nn as nn
 
 # Default dimension constants (kept in sync with config.py)
 _MACRO_DIM  = 11
-_LOB_DIM    = 4
+_LOB_DIM    = 5
 _PRIV_DIM   = 2
-_N_DIR      = 2
-_N_SIZE     = 1
+_N_DIR      = 3
+_N_SIZE     = 4
 _GRU_HIDDEN = 128
 _MACRO_EMB  = 64
 _FC_HIDDEN  = 128
@@ -73,7 +68,7 @@ class MicroEncoder(nn.Module):
     concatenated to form the micro-level embedding e^i_t.
 
     Args:
-        lob_dim    : Feature dim per timestep for the LOB stream (default 4).
+        lob_dim    : Feature dim per timestep for the LOB stream (default 5).
         priv_dim   : Feature dim per timestep for the private-state stream (default 2).
         gru_hidden : GRU hidden size for each stream (paper searches [32,64,128]).
     """
@@ -148,43 +143,18 @@ class MacroEncoder(nn.Module):
 # (c) Risk-aware auxiliary task — Section 4.4
 # ---------------------------------------------------------------------------
 
-class VolatilityHead(nn.Module):
-    """Single-layer MLP for volatility prediction (risk-aware auxiliary task).
-
-    Predicts the realised return standard-deviation over the observation window.
-    Only active during training; not used at inference time.
-
-    Args:
-        embed_dim : Dimensionality of the market embedding.
-    """
-
-    def __init__(self, embed_dim: int) -> None:
-        super().__init__()
-        self.fc = nn.Linear(embed_dim, 1)
-
-    def forward(self, e: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            e : Market embedding (batch, embed_dim).
-        Returns:
-            Predicted volatility (batch, 1).
-        """
-        return self.fc(e)
-
-
 # ---------------------------------------------------------------------------
-# Full DeepScalper network: BDQ + VolHead
+# Full DeepScalper network: BDQ
 # ---------------------------------------------------------------------------
 
 class DeepScalperNet(nn.Module):
-    """DeepScalper complete network (BDQ + Volatility head).
+    """DeepScalper complete network (BDQ).
 
     Combines the macro and micro encoders into a market embedding, then
     branches into:
       - Shared value head  V(s)
       - Direction advantage head  A_dir(s, a_dir)
       - Size advantage head       A_size(s, a_size)
-      - Volatility prediction head (auxiliary training signal)
 
     Q-value computation (standard dueling aggregation per branch):
         Q_dir  = V(s) + A_dir(s,a)  − mean_{a'} A_dir(s,a')
@@ -192,13 +162,13 @@ class DeepScalperNet(nn.Module):
 
     Args:
         macro_dim   : MACRO_DIM (11).
-        lob_dim     : LOB_DIM (4).
+        lob_dim     : LOB_DIM (5).
         priv_dim    : PRIV_DIM (2).
         gru_hidden  : GRU hidden size per stream.
         macro_embed : MacroEncoder output dimension.
         fc_hidden   : FC layer width in advantage / value heads.
-        n_dir       : Number of direction actions (N_DIR = 2).
-        n_size      : Number of size actions (N_SIZE = 1).
+        n_dir       : Number of direction actions (N_DIR = 3).
+        n_size      : Number of size actions (N_SIZE = 4).
     """
 
     def __init__(
@@ -244,9 +214,6 @@ class DeepScalperNet(nn.Module):
             nn.Linear(fc_hidden, n_size),
         )
 
-        # Volatility prediction head (auxiliary task)
-        self.vol_head = VolatilityHead(embed_dim)
-
         self._init_weights()
 
     def _init_weights(self) -> None:
@@ -291,7 +258,6 @@ class DeepScalperNet(nn.Module):
         Returns:
             q_dir  : (batch, n_dir)   — Q-values for each direction action
             q_size : (batch, n_size)  — Q-values for each size action
-            vol    : (batch, 1)       — predicted realised volatility
         """
         e = self.embed(lob, priv, macro)   # (batch, embed_dim)
 
@@ -303,9 +269,7 @@ class DeepScalperNet(nn.Module):
         q_dir  = value + (a_dir  - a_dir.mean(dim=1,  keepdim=True))
         q_size = value + (a_size - a_size.mean(dim=1, keepdim=True))
 
-        vol = self.vol_head(e)             # (batch, 1)
-
-        return q_dir, q_size, vol
+        return q_dir, q_size
 
 
 # ---------------------------------------------------------------------------
@@ -317,7 +281,7 @@ class DeepScalperNet(nn.Module):
 class DuelingQNetwork(DeepScalperNet):
     """Deprecated — use DeepScalperNet.  Kept for backward compatibility."""
 
-    def __init__(self, lookback_bars=60, input_dim=11, action_dim=2,
+    def __init__(self, lookback_bars=60, input_dim=11, action_dim=3,
                  hidden_size=128, fc_size=128, dropout_rate=0.0, **kwargs):
         super().__init__(
             macro_dim=input_dim,

@@ -11,7 +11,6 @@ Displayed metrics:
 from datetime import datetime
 
 import pytz
-from PyQt5.QtCore import Qt
 from PyQt5.QtGui import QFont
 from PyQt5.QtWidgets import QHBoxLayout, QLabel, QWidget
 

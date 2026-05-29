@@ -28,6 +28,7 @@ from deepscalper.utils import (
     compute_sharpe,
     compute_win_rate,
 )
+from config import LOB_DIM
 
 
 # ---------------------------------------------------------------------------
@@ -125,7 +126,7 @@ class TestComputeMacroFeatures:
 class TestComputeMicroFeaturesProxy:
     def test_shape(self):
         feats = compute_micro_features(_bars(60))
-        assert feats.shape == (60, 4)
+        assert feats.shape == (60, LOB_DIM)
 
     def test_dtype(self):
         feats = compute_micro_features(_bars(60))
@@ -160,7 +161,7 @@ class TestComputeMicroFeaturesProxy:
         """Default call (no lob_snapshots) should silently use proxy."""
         bars = _bars(20)
         feats = compute_micro_features(bars)
-        assert feats.shape == (20, 4)
+        assert feats.shape == (20, LOB_DIM)
 
 
 # ===========================================================================
@@ -172,13 +173,13 @@ class TestComputeMicroFeaturesRealLOB:
         feats = compute_micro_features(
             _bars(1), lob_snapshots=_lob_snap(1), use_proxy=False
         )
-        assert feats.shape == (1, 4)
+        assert feats.shape == (1, LOB_DIM)
 
     def test_shape_multi_row(self):
         feats = compute_micro_features(
             _bars(30), lob_snapshots=_lob_snap(30), use_proxy=False
         )
-        assert feats.shape == (30, 4)
+        assert feats.shape == (30, LOB_DIM)
 
     def test_dtype(self):
         feats = compute_micro_features(

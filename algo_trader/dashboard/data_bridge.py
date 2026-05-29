@@ -13,7 +13,7 @@ between these two worlds.
 import threading
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Dict, List, Optional
+from typing import Dict, List
 
 from config import MAX_TRADE_LOG_ENTRIES
 

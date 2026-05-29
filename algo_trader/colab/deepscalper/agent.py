@@ -1,22 +1,27 @@
 """
-colab/deepscalper/agent.py — DeepScalper RL Agent (1:1 paper replica).
+colab/deepscalper/agent.py — DeepScalper RL Agent.
 
-Implements the four core components of DeepScalper (CIKM '22, Sun et al.):
+Implements a TradeMaster-aligned DQN training core with local model compatibility.
 
-  1. Branching DQN (BDQ) with per-branch Double-DQN targets
+    1. Branching DQN (BDQ) with per-branch Double-DQN targets
        L_q = (1/|D|) Σ_d Σ_b w_b (y_d - Q_d(s_b, a_d_b))²
        where d ∈ {direction, size}, w_b = IS weights from PER
 
-  2. Hindsight bonus reward (Section 4.2)
+  2. TradeMaster-style update rhythm
+      update_times = int(repeat_times * added_since_last_update)
+      gradient clipping = clip_grad_norm
+      soft update factor = soft_update_tau
+
+  3. Hindsight bonus reward (Section 4.2)
        r_H = r_t + w × log(P_{t+h} / P_t) × position
        Applied at store() time; w=0.01, h=60.
 
-  3. Prioritized Experience Replay (PER) with SumTree (O(log N) ops)
+    4. Prioritized Experience Replay (PER) with SumTree (O(log N) ops)
        Stores dict observations + separate vol_target for the auxiliary task.
 
-  4. Volatility auxiliary task (Section 4.4)
-       L_vol = MSE(vol_head(e_t), realized_vol_target)
-       Total: L = L_q + η × L_vol  (η = 1.0)
+    Note: The default loss path now mirrors TradeMaster DQN (Q-loss only).
+    Volatility auxiliary outputs may still exist in the network for checkpoint
+    compatibility but are not included in the default optimization objective.
 
 Observation format (dict):
     obs['lob']   → np.ndarray (seq_len, LOB_DIM=4)   micro features
@@ -24,8 +29,8 @@ Observation format (dict):
     obs['macro'] → np.ndarray (MACRO_DIM=11,)         current-bar macro features
 
 Actions:
-    dir_action  ∈ {0=FLAT, 1=LONG}
-    size_action ∈ {0}  (single size branch in V2)
+    dir_action  ∈ {0=SHORT, 1=FLAT, 2=LONG}
+    size_action ∈ {0..N_SIZE-1}
 """
 
 import logging
@@ -36,7 +41,6 @@ from typing import Dict, Optional, Tuple
 import numpy as np
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 import torch.optim as optim
 
 from colab.deepscalper.architecture import DeepScalperNet
@@ -157,7 +161,6 @@ class PrioritizedReplayBuffer:
         indices   = np.zeros(batch_size, dtype=np.int64)
         weights   = np.zeros(batch_size, dtype=np.float32)
         segment   = self.tree.total / batch_size
-        min_prob  = (self.tree.tree[self.tree.capacity - 1] / self.tree.total + 1e-10)
 
         obs_lob   = []
         obs_priv  = []
@@ -226,11 +229,78 @@ class PrioritizedReplayBuffer:
 
 
 # ---------------------------------------------------------------------------
+# Uniform Replay Buffer (TradeMaster-style default)
+# ---------------------------------------------------------------------------
+
+class ReplayBuffer:
+    """Uniform replay buffer used by the TradeMaster parity training path."""
+
+    def __init__(self, capacity: int = 1_000_000) -> None:
+        self.capacity = int(capacity)
+        self._data = [None] * self.capacity
+        self._write = 0
+        self._size = 0
+
+    def push(
+        self,
+        obs: Dict[str, np.ndarray],
+        dir_action: int,
+        size_action: int,
+        reward: float,
+        next_obs: Dict[str, np.ndarray],
+        done: bool,
+    ) -> None:
+        self._data[self._write] = (obs, dir_action, size_action, reward, next_obs, done)
+        self._write = (self._write + 1) % self.capacity
+        self._size = min(self._size + 1, self.capacity)
+
+    def sample(self, batch_size: int, device: str = "cpu"):
+        indices = np.random.randint(0, self._size, size=batch_size)
+        samples = [self._data[i] for i in indices]
+
+        obs_lob, obs_priv, obs_macro = [], [], []
+        dir_acts, size_acts, rewards = [], [], []
+        nob_lob, nob_priv, nob_macro = [], [], []
+        dones = []
+
+        for obs, d_act, s_act, rew, nobs, dn in samples:
+            obs_lob.append(obs["lob"])
+            obs_priv.append(obs["priv"])
+            obs_macro.append(obs["macro"])
+            dir_acts.append(d_act)
+            size_acts.append(s_act)
+            rewards.append(rew)
+            nob_lob.append(nobs["lob"])
+            nob_priv.append(nobs["priv"])
+            nob_macro.append(nobs["macro"])
+            dones.append(float(dn))
+
+        def _t(arr, dtype=torch.float32):
+            return torch.tensor(np.array(arr), dtype=dtype, device=device)
+
+        return {
+            "lob": _t(obs_lob),
+            "priv": _t(obs_priv),
+            "macro": _t(obs_macro),
+            "dir_acts": _t(dir_acts, torch.long),
+            "size_acts": _t(size_acts, torch.long),
+            "rewards": _t(rewards),
+            "next_lob": _t(nob_lob),
+            "next_priv": _t(nob_priv),
+            "next_macro": _t(nob_macro),
+            "dones": _t(dones),
+        }
+
+    def __len__(self) -> int:
+        return self._size
+
+
+# ---------------------------------------------------------------------------
 # DeepScalper Agent
 # ---------------------------------------------------------------------------
 
 class DeepScalperAgent:
-    """DeepScalper RL agent — BDQ + PER + hindsight bonus + vol auxiliary task.
+    """DeepScalper RL agent with TradeMaster-style training controls.
 
     Args:
         macro_dim      : MACRO_DIM (11).
@@ -243,14 +313,14 @@ class DeepScalperAgent:
         fc_hidden      : Width of FC layers in BDQ heads.
         lr             : Adam learning rate.
         gamma          : Reward discount factor.
-        tau            : Soft target-network update rate.
+        soft_update_tau: TradeMaster target update interpolation factor.
+        state_value_tau: TradeMaster compatibility parameter (stored for parity).
+        repeat_times   : Number of update passes per newly added transition.
+        clip_grad_norm : Gradient clipping max-norm.
         batch_size     : Training mini-batch size.
         buffer_capacity: PER buffer capacity.
-        epsilon_start  : Initial exploration rate.
-        epsilon_end    : Minimum exploration rate.
-        epsilon_decay  : Steps over which ε is linearly decayed.
-        aux_eta        : Weight for the volatility auxiliary loss (η).
-        hindsight_w    : Hindsight bonus weight (w).
+        explore_rate   : Static epsilon-greedy exploration probability.
+        tau/epsilon_*  : Deprecated aliases retained for notebook compatibility.
         device         : 'cuda' or 'cpu'.
     """
 
@@ -264,14 +334,19 @@ class DeepScalperAgent:
         gru_hidden:      int   = 128,
         macro_embed:     int   = 64,
         fc_hidden:       int   = 128,
-        lr:              float = 1e-4,
-        gamma:           float = 0.99,
-        tau:             float = 0.01,
+        lr:              float = 1e-3,
+        gamma:           float = 0.9,
+        repeat_times:    float = 1.0,
+        clip_grad_norm:  float = 3.0,
+        soft_update_tau: float = 0.0,
+        state_value_tau: float = 0.005,
         batch_size:      int   = 64,
-        buffer_capacity: int   = 100_000,
-        epsilon_start:   float = 1.0,
-        epsilon_end:     float = 0.05,
-        epsilon_decay:   int   = 50_000,
+        buffer_capacity: int   = 1_000_000,
+        explore_rate:    float = 0.25,
+        tau:             Optional[float] = None,
+        epsilon_start:   Optional[float] = None,
+        epsilon_end:     Optional[float] = None,
+        epsilon_decay:   Optional[int] = None,
         aux_eta:         float = 1.0,
         hindsight_w:     float = 0.01,
         device:          str   = "cpu",
@@ -279,15 +354,23 @@ class DeepScalperAgent:
         self.n_dir         = n_dir
         self.n_size        = n_size
         self.gamma         = gamma
-        self.tau           = tau
+        self.repeat_times  = repeat_times
+        self.clip_grad_norm = clip_grad_norm
+        self.soft_update_tau = soft_update_tau if tau is None else float(tau)
+        self.state_value_tau = state_value_tau
         self.batch_size    = batch_size
         self.aux_eta       = aux_eta
         self.hindsight_w   = hindsight_w
         self.device        = device
-        self.epsilon       = epsilon_start
-        self.epsilon_end   = epsilon_end
-        self.epsilon_decay = epsilon_decay
+        self.explore_rate  = (
+            float(epsilon_start) if epsilon_start is not None else float(explore_rate)
+        )
+        # Backward-compat aliases used by notebooks/tests.
+        self.epsilon       = self.explore_rate
+        self.epsilon_end   = self.explore_rate if epsilon_end is None else float(epsilon_end)
+        self.epsilon_decay = 1 if epsilon_decay is None else int(epsilon_decay)
         self._steps        = 0
+        self._added_since_update = 0
 
         net_kwargs = dict(
             macro_dim=macro_dim,
@@ -305,7 +388,7 @@ class DeepScalperAgent:
         self.target_net.eval()
 
         self.optimizer = optim.Adam(self.online_net.parameters(), lr=lr)
-        self.buffer = PrioritizedReplayBuffer(capacity=buffer_capacity)
+        self.buffer = ReplayBuffer(capacity=buffer_capacity)
 
     # ------------------------------------------------------------------
     # Hindsight bonus reward — Section 4.2
@@ -346,10 +429,12 @@ class DeepScalperAgent:
         reward:     float,
         next_obs:   Dict[str, np.ndarray],
         done:       bool,
-        vol_target: float,
+        vol_target: float = 0.0,
     ) -> None:
         """Push one transition into the replay buffer."""
-        self.buffer.push(obs, dir_action, size_action, reward, next_obs, done, vol_target)
+        _ = vol_target
+        self.buffer.push(obs, dir_action, size_action, reward, next_obs, done)
+        self._added_since_update += 1
 
     # ------------------------------------------------------------------
     # Action selection
@@ -359,7 +444,7 @@ class DeepScalperAgent:
         self,
         obs: Dict[str, np.ndarray],
     ) -> Tuple[int, int]:
-        """ε-greedy action selection.
+        """TradeMaster-style static ε-greedy action selection.
 
         Args:
             obs : Dict with keys 'lob' (seq,5), 'priv' (seq,2), 'macro' (11,).
@@ -367,14 +452,10 @@ class DeepScalperAgent:
         Returns:
             (dir_action, size_action) — integer indices for each branch.
         """
-        # Linear ε decay
-        self.epsilon = max(
-            self.epsilon_end,
-            self.epsilon - (1.0 - self.epsilon_end) / self.epsilon_decay,
-        )
         self._steps += 1
+        self.epsilon = self.explore_rate
 
-        if random.random() < self.epsilon:
+        if random.random() < self.explore_rate:
             return random.randrange(self.n_dir), random.randrange(self.n_size)
 
         self.online_net.eval()
@@ -382,16 +463,16 @@ class DeepScalperAgent:
             lob   = torch.tensor(obs['lob'][None],   dtype=torch.float32, device=self.device)
             priv  = torch.tensor(obs['priv'][None],  dtype=torch.float32, device=self.device)
             macro = torch.tensor(obs['macro'][None],  dtype=torch.float32, device=self.device)
-            q_dir, q_size, _ = self.online_net(lob, priv, macro)
+            q_dir, q_size = self.online_net(lob, priv, macro)
         self.online_net.train()
         return int(q_dir.argmax(1).item()), int(q_size.argmax(1).item())
 
     # ------------------------------------------------------------------
-    # Training step — BDQ Double-DQN + PER + aux loss
+    # Training step — BDQ Double-DQN + PER (TradeMaster-style controls)
     # ------------------------------------------------------------------
 
-    def learn(self) -> Optional[float]:
-        """Sample from buffer, compute BDQ + vol loss, and update online net.
+    def _train_step(self) -> Optional[float]:
+        """Run one optimization step.
 
         Returns:
             Total loss as a float, or None if buffer is too small.
@@ -399,7 +480,7 @@ class DeepScalperAgent:
         if len(self.buffer) < self.batch_size:
             return None
 
-        batch, indices, _ = self.buffer.sample(self.batch_size, device=self.device)
+        batch = self.buffer.sample(self.batch_size, device=self.device)
 
         lob   = batch['lob']
         priv  = batch['priv']
@@ -412,21 +493,19 @@ class DeepScalperAgent:
         size_acts = batch['size_acts']   # (B,)
         rewards   = batch['rewards']     # (B,)
         dones     = batch['dones']       # (B,)
-        vol_tgts  = batch['vol_tgts']    # (B,)
-        is_weights = batch['weights']    # (B,) IS correction
 
         # -- Online network forward --
-        q_dir, q_size, vol_pred = self.online_net(lob, priv, macro)
+        q_dir, q_size = self.online_net(lob, priv, macro)
 
         # -- Double-DQN targets: select action with online net, eval with target --
         with torch.no_grad():
             # online net picks best next-action for each branch
-            nq_dir_online, nq_size_online, _ = self.online_net(nlob, npriv, nmacro)
+            nq_dir_online, nq_size_online = self.online_net(nlob, npriv, nmacro)
             next_dir_acts  = nq_dir_online.argmax(1)
             next_size_acts = nq_size_online.argmax(1)
 
             # target net evaluates those actions
-            nq_dir_target, nq_size_target, _ = self.target_net(nlob, npriv, nmacro)
+            nq_dir_target, nq_size_target = self.target_net(nlob, npriv, nmacro)
             next_q_dir  = nq_dir_target.gather(1,  next_dir_acts.unsqueeze(1)).squeeze(1)
             next_q_size = nq_size_target.gather(1, next_size_acts.unsqueeze(1)).squeeze(1)
 
@@ -439,31 +518,45 @@ class DeepScalperAgent:
 
         td_dir  = (y_dir  - q_dir_a).pow(2)
         td_size = (y_size - q_size_a).pow(2)
-        l_q = (is_weights * (td_dir + td_size) / 2.0).mean()
-
-        # -- Volatility auxiliary loss (Section 4.4) --
-        vol_pred_flat = vol_pred.squeeze(1)
-        l_vol = F.mse_loss(vol_pred_flat, vol_tgts)
-
-        loss = l_q + self.aux_eta * l_vol
+        l_q = ((td_dir + td_size) / 2.0).mean()
+        loss = l_q
 
         # -- Backprop --
         self.optimizer.zero_grad()
         loss.backward()
-        nn.utils.clip_grad_norm_(self.online_net.parameters(), max_norm=1.0)
+        nn.utils.clip_grad_norm_(self.online_net.parameters(), max_norm=self.clip_grad_norm)
         self.optimizer.step()
 
-        # -- Update PER priorities --
-        td_errors = ((td_dir + td_size) / 2.0).detach().cpu().numpy()
-        self.buffer.update_priorities(indices, td_errors + 1e-6)
-
         # -- Soft target update --
-        for online_p, target_p in zip(
-            self.online_net.parameters(), self.target_net.parameters()
-        ):
-            target_p.data.copy_(self.tau * online_p.data + (1.0 - self.tau) * target_p.data)
+        for online_p, target_p in zip(self.online_net.parameters(), self.target_net.parameters()):
+            target_p.data.copy_(
+                self.soft_update_tau * online_p.data + (1.0 - self.soft_update_tau) * target_p.data
+            )
 
         return float(loss.item())
+
+    def update_net(self) -> Optional[float]:
+        """TradeMaster-style repeated updates based on newly added transitions."""
+        if len(self.buffer) < self.batch_size:
+            return None
+
+        added = max(1, int(self._added_since_update))
+        update_times = max(1, int(added * self.repeat_times))
+        self._added_since_update = 0
+
+        losses = []
+        for _ in range(update_times):
+            loss = self._train_step()
+            if loss is not None:
+                losses.append(loss)
+
+        if not losses:
+            return None
+        return float(np.mean(losses))
+
+    def learn(self) -> Optional[float]:
+        """Backward-compatible alias for update_net()."""
+        return self.update_net()
 
     # ------------------------------------------------------------------
     # Persistence
@@ -477,6 +570,7 @@ class DeepScalperAgent:
             "online_net": self.online_net.state_dict(),
             "target_net": self.target_net.state_dict(),
             "optimizer":  self.optimizer.state_dict(),
+            "explore_rate": self.explore_rate,
             "epsilon":    self.epsilon,
             "steps":      self._steps,
         }, str(p))
@@ -488,6 +582,8 @@ class DeepScalperAgent:
         self.online_net.load_state_dict(ckpt["online_net"])
         self.target_net.load_state_dict(ckpt["target_net"])
         self.optimizer.load_state_dict(ckpt["optimizer"])
-        self.epsilon = ckpt.get("epsilon", self.epsilon_end)
+        self.explore_rate = float(ckpt.get("explore_rate", ckpt.get("epsilon", self.explore_rate)))
+        self.epsilon = self.explore_rate
+        self.epsilon_end = self.explore_rate
         self._steps  = ckpt.get("steps",   0)
         logger.info("Loaded agent from %s", path)

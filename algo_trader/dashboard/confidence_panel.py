@@ -251,8 +251,6 @@ class ConfidencePanel(QWidget):
 
         # Insert / update cards in sorted order
         # Re-build card order by clearing and re-adding (simple but effective at 1Hz)
-        # Remove the stretch first
-        stretch_item = self._card_layout.itemAt(self._card_layout.count() - 1)
 
         for i, sym in enumerate(sorted_syms):
             if sym not in self._cards:
