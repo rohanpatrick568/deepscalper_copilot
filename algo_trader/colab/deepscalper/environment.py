@@ -294,6 +294,9 @@ class ScalperEnv(gym.Env):
             terminal_liquidation = True
             self._position = 0
             self._entry_price = 0.0
+        net_log_return = immediate_reward - (
+            self.transaction_cost_pct if terminal_liquidation else 0.0
+        )
 
         # Unrealized P&L for private state
         if self._position == 1 and self._entry_price > 0:
@@ -324,6 +327,7 @@ class ScalperEnv(gym.Env):
             'transaction_cost': transaction_cost
                                 + (self.transaction_cost_pct if terminal_liquidation else 0.0),
             'terminal_liquidation': terminal_liquidation,
+            'net_log_return': net_log_return,
         }
 
         obs = self._get_obs()

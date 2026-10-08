@@ -46,8 +46,8 @@ class TestActionSpace:
     def test_n_dir_is_3(self):
         assert config.N_DIR == 3
 
-    def test_n_size_is_4(self):
-        assert config.N_SIZE == 4
+    def test_size_branch_is_deliberately_fixed(self):
+        assert config.N_SIZE == 1
 
     def test_action_dim_is_3(self):
         assert config.ACTION_DIM == 3

@@ -1,5 +1,6 @@
 # Shared Local/Colab training and evaluation dependencies.
 torch==2.7.1
+alpaca-py==0.42.0
 numpy==1.26.4
 pandas==2.3.3
 scipy==1.15.3

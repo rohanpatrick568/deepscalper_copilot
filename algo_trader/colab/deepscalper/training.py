@@ -15,7 +15,7 @@ import sys
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Mapping, Sequence
+from typing import Any, Callable, Mapping, Sequence
 
 import numpy as np
 import torch
@@ -24,6 +24,26 @@ from .agent import DeepScalperAgent
 from .environment import ScalperEnv
 
 ARTIFACT_FORMAT = "deepscalper-shared-v1"
+FEATURE_SCHEMA = {
+    "macro": [
+        "z_open", "z_high", "z_low", "z_close", "z_adj_close",
+        "z_d_5", "z_d_10", "z_d_15", "z_d_20", "z_d_25", "z_d_30",
+    ],
+    "micro": [
+        "relative_spread", "depth_imbalance", "microprice_deviation",
+        "trade_intensity", "short_return",
+    ],
+    "private": ["position_sign", "unrealized_pnl_fraction"],
+}
+ACTION_SCHEMA = {
+    "direction": {"0": "SHORT", "1": "FLAT", "2": "LONG"},
+    "size": "fixed risk allocation; model size branch disabled",
+    "execution_timing": "action at close[t], fill at close[t], reward close[t] to close[t+1]",
+}
+
+
+class TrainingCancelled(RuntimeError):
+    pass
 REQUIRED_MANIFEST_KEYS = {
     "format",
     "symbol",
@@ -33,6 +53,9 @@ REQUIRED_MANIFEST_KEYS = {
     "splits",
     "metrics",
     "provenance",
+    "feature_schema",
+    "action_schema",
+    "universe",
 }
 
 
@@ -42,11 +65,11 @@ class ModelConfig:
     lob_dim: int = 5
     priv_dim: int = 2
     n_dir: int = 3
-    n_size: int = 4
+    n_size: int = 1
     gru_hidden: int = 128
     macro_embed: int = 64
     fc_hidden: int = 128
-    lookback_bars: int = 10
+    lookback_bars: int = 60
 
 
 @dataclass(frozen=True)
@@ -70,6 +93,7 @@ class MarketData:
     lob: np.ndarray
     macro: np.ndarray
     close: np.ndarray
+    day_starts: np.ndarray | None = None
 
     def validate(self) -> None:
         lengths = {len(self.lob), len(self.macro), len(self.close)}
@@ -81,6 +105,16 @@ class MarketData:
             raise ValueError("training data contains non-finite values")
         if np.any(self.close <= 0):
             raise ValueError("close prices must be positive")
+        if self.day_starts is not None:
+            starts = np.asarray(self.day_starts, dtype=int)
+            if (
+                starts.ndim != 1
+                or len(starts) == 0
+                or starts[0] != 0
+                or np.any(np.diff(starts) <= 0)
+                or starts[-1] >= len(self.close)
+            ):
+                raise ValueError("day_starts must be ordered unique indices beginning at zero")
 
 
 def synthetic_market_data(
@@ -114,6 +148,11 @@ def load_market_data(path: Path) -> MarketData:
             lob=np.asarray(payload["lob"], dtype=np.float32),
             macro=np.asarray(payload["macro"], dtype=np.float32),
             close=np.asarray(payload["close"], dtype=np.float64),
+            day_starts=(
+                np.asarray(payload["day_starts"], dtype=np.int64)
+                if "day_starts" in payload.files
+                else None
+            ),
         )
     data.validate()
     return data
@@ -132,8 +171,19 @@ def chronological_split(
     if train_fraction + validation_fraction >= 1:
         raise ValueError("train + validation fractions must leave a holdout")
     n = len(data.close)
-    train_end = int(n * train_fraction)
-    validation_end = int(n * (train_fraction + validation_fraction))
+    if data.day_starts is not None and len(data.day_starts) >= 3:
+        day_starts = np.asarray(data.day_starts, dtype=int)
+        day_count = len(day_starts)
+        train_days = max(1, int(day_count * train_fraction))
+        validation_days = max(1, int(day_count * validation_fraction))
+        if train_days + validation_days >= day_count:
+            train_days = day_count - 2
+            validation_days = 1
+        train_end = int(day_starts[train_days])
+        validation_end = int(day_starts[train_days + validation_days])
+    else:
+        train_end = int(n * train_fraction)
+        validation_end = int(n * (train_fraction + validation_fraction))
     ranges = {
         "train": (0, train_end),
         "validation": (train_end, validation_end),
@@ -146,7 +196,17 @@ def chronological_split(
 
     def subset(bounds: tuple[int, int]) -> MarketData:
         start, end = bounds
-        return MarketData(data.lob[start:end], data.macro[start:end], data.close[start:end])
+        subset_starts = None
+        if data.day_starts is not None:
+            within = np.asarray(data.day_starts)
+            within = within[(within >= start) & (within < end)] - start
+            subset_starts = np.unique(np.r_[0, within]).astype(np.int64)
+        return MarketData(
+            data.lob[start:end],
+            data.macro[start:end],
+            data.close[start:end],
+            subset_starts,
+        )
 
     return (
         {name: subset(bounds) for name, bounds in ranges.items()},
@@ -164,7 +224,10 @@ def file_sha256(path: Path) -> str:
 
 def data_sha256(data: MarketData) -> str:
     digest = hashlib.sha256()
-    for values in (data.lob, data.macro, data.close):
+    arrays = [data.lob, data.macro, data.close]
+    if data.day_starts is not None:
+        arrays.append(np.asarray(data.day_starts))
+    for values in arrays:
         contiguous = np.ascontiguousarray(values)
         digest.update(str(contiguous.shape).encode())
         digest.update(str(contiguous.dtype).encode())
@@ -248,7 +311,11 @@ def _make_env(
         lob_features=data.lob,
         macro_features=data.macro,
         close_prices=data.close,
-        day_starts=[0],
+        day_starts=(
+            np.asarray(data.day_starts, dtype=int).tolist()
+            if data.day_starts is not None
+            else [0]
+        ),
         random_day_reset=False,
         lookback_bars=model.lookback_bars,
         transaction_cost_pct=training.transaction_cost_pct,
@@ -264,22 +331,25 @@ def _run_training_epoch(
     seed: int,
     max_steps: int | None,
 ) -> dict[str, float]:
-    obs, _ = env.reset(seed=seed, options={"day_idx": 0})
     rewards: list[float] = []
     losses: list[float] = []
-    done = False
     steps = 0
-    while not done and (max_steps is None or steps < max_steps):
-        direction, size = agent.select_action(obs, explore=True)
-        next_obs, reward, terminated, truncated, info = env.step(direction)
-        done = terminated or truncated
-        agent.store(obs, direction, size, reward, next_obs, done, info["vol_target"])
-        loss = agent.update_net()
-        if loss is not None:
-            losses.append(loss)
-        rewards.append(float(reward))
-        obs = next_obs
-        steps += 1
+    for day_idx in range(len(env.day_starts)):
+        obs, _ = env.reset(seed=seed + day_idx, options={"day_idx": day_idx})
+        done = False
+        while not done and (max_steps is None or steps < max_steps):
+            direction, size = agent.select_action(obs, explore=True)
+            next_obs, reward, terminated, truncated, info = env.step(direction)
+            done = terminated or truncated
+            agent.store(obs, direction, size, reward, next_obs, done, info["vol_target"])
+            loss = agent.update_net()
+            if loss is not None:
+                losses.append(loss)
+            rewards.append(float(reward))
+            obs = next_obs
+            steps += 1
+        if max_steps is not None and steps >= max_steps:
+            break
     return {
         "return": float(np.sum(rewards)),
         "mean_loss": float(np.mean(losses)) if losses else 0.0,
@@ -297,34 +367,42 @@ def evaluate(
 ) -> dict[str, float | int]:
     """Evaluate greedily with costs, no hindsight/exploration, and liquidation."""
     env = _make_env(data, model, training, is_training=False)
-    obs, _ = env.reset(seed=seed, options={"day_idx": 0})
-    rewards: list[float] = []
+    net_log_returns: list[float] = []
     positions: list[int] = []
     costs = 0.0
     liquidations = 0
-    done = False
-    while not done:
-        direction, _ = agent.select_action(obs, explore=False)
-        obs, reward, terminated, truncated, info = env.step(direction)
-        done = terminated or truncated
-        rewards.append(float(reward))
-        positions.append(int(info["position"]))
-        costs += float(info["transaction_cost"])
-        liquidations += int(info["terminal_liquidation"])
-    values = np.asarray(rewards, dtype=np.float64)
-    curve = np.cumsum(values)
-    peaks = np.maximum.accumulate(np.r_[0.0, curve])
-    drawdowns = peaks[1:] - curve
+    days_visited: list[int] = []
+    for day_idx in range(len(env.day_starts)):
+        obs, _ = env.reset(seed=seed + day_idx, options={"day_idx": day_idx})
+        days_visited.append(day_idx)
+        done = False
+        while not done:
+            direction, _ = agent.select_action(obs, explore=False)
+            obs, reward, terminated, truncated, info = env.step(direction)
+            done = terminated or truncated
+            net_log_returns.append(float(info["net_log_return"]))
+            positions.append(int(info["position"]))
+            costs += float(info["transaction_cost"])
+            liquidations += int(info["terminal_liquidation"])
+    values = np.asarray(net_log_returns, dtype=np.float64)
+    equity = np.exp(np.cumsum(values))
+    net_return = float(equity[-1] - 1.0) if len(equity) else 0.0
+    peaks = np.maximum.accumulate(np.r_[1.0, equity])
+    drawdowns = 1.0 - equity / peaks[1:]
     std = float(values.std(ddof=1)) if len(values) > 1 else 0.0
+    periods_per_year = 252 * 390
     return {
-        "return": float(values.sum()),
-        "sharpe": float(values.mean() / std * np.sqrt(len(values))) if std > 0 else 0.0,
+        "return": net_return,
+        "net_log_return": float(values.sum()),
+        "sharpe": float(values.mean() / std * np.sqrt(periods_per_year)) if std > 0 else 0.0,
+        "annualization_periods": periods_per_year,
         "max_drawdown": float(drawdowns.max()) if len(drawdowns) else 0.0,
-        "steps": len(rewards),
+        "steps": len(net_log_returns),
         "position_changes": int(np.count_nonzero(np.diff(np.r_[0, positions]))),
         "transaction_cost": costs,
         "terminal_liquidations": liquidations,
         "exploration_rate": 0.0,
+        "days_visited": days_visited,
     }
 
 
@@ -373,12 +451,17 @@ def train_shared(
     model: ModelConfig = ModelConfig(),
     training: TrainConfig = TrainConfig(),
     device: str = "cpu",
+    location: str,
+    cancel_path: Path | None = None,
+    progress: Callable[[dict[str, Any]], None] | None = None,
     resume: bool = False,
-    min_validation_return: float = -1.0,
-    min_holdout_return: float = -1.0,
-    max_holdout_drawdown: float = 1.0,
+    min_validation_return: float = 0.0,
+    min_holdout_return: float = 0.0,
+    max_holdout_drawdown: float = 0.10,
 ) -> dict[str, Any]:
     """Run the canonical entry point used by both local and Colab launchers."""
+    if location not in {"local", "colab"}:
+        raise ValueError("location must be explicitly selected as local or colab")
     data.validate()
     if data.lob.shape[1] != model.lob_dim or data.macro.shape[1] != model.macro_dim:
         raise ValueError("dataset feature dimensions do not match model configuration")
@@ -413,6 +496,10 @@ def train_shared(
     history: list[dict[str, Any]] = []
     train_env = _make_env(split_data["train"], model, training, is_training=True)
     for epoch in range(start_epoch, training.epochs):
+        if cancel_path is not None and Path(cancel_path).exists():
+            raise TrainingCancelled(
+                f"Cancellation requested before epoch {epoch}; resume from {latest_path}"
+            )
         epoch_seed = training.seed + epoch
         _seed_everything(epoch_seed)
         train_metrics = _run_training_epoch(
@@ -460,6 +547,15 @@ def train_shared(
                 "best_checkpoint": best_path.name,
             },
         )
+        if progress is not None:
+            progress(
+                {
+                    "epoch": epoch + 1,
+                    "epochs": training.epochs,
+                    "validation_return": validation_return,
+                    "best_validation_return": best_validation_return,
+                }
+            )
 
     if not best_path.is_file():
         raise ValueError(
@@ -487,6 +583,9 @@ def train_shared(
         "checkpoint": best_path.name,
         "checkpoint_sha256": file_sha256(best_path),
         "accepted": bool(accepted),
+        "universe": [symbol],
+        "feature_schema": FEATURE_SCHEMA,
+        "action_schema": ACTION_SCHEMA,
         "acceptance": {
             "min_validation_return": min_validation_return,
             "min_holdout_return": min_holdout_return,
@@ -512,6 +611,7 @@ def train_shared(
         },
         "provenance": {
             "backend": {
+                "location": location,
                 "requested_device": device,
                 "torch_device": str(next(agent.online_net.parameters()).device),
                 "cuda_available": torch.cuda.is_available(),
@@ -522,6 +622,17 @@ def train_shared(
             "dependencies": _dependencies(),
             "code_revision": _code_revision(),
             "data_sha256": data_sha256(data),
+            "config_sha256": hashlib.sha256(
+                json.dumps(
+                    {
+                        "model": asdict(model),
+                        "training": asdict(training),
+                        "features": FEATURE_SCHEMA,
+                        "actions": ACTION_SCHEMA,
+                    },
+                    sort_keys=True,
+                ).encode()
+            ).hexdigest(),
             "resumed": resumed,
             "replay_buffer_restored": False,
         },
@@ -553,6 +664,10 @@ def validate_artifact(checkpoint_path: Path, manifest_path: Path | None = None) 
         raise ValueError("checkpoint is not a shared DeepScalper artifact")
     if checkpoint.get("model_config") != manifest["model"]:
         raise ValueError("checkpoint and manifest model configurations differ")
+    if manifest["feature_schema"] != FEATURE_SCHEMA:
+        raise ValueError("artifact feature schema is incompatible")
+    if manifest["action_schema"] != ACTION_SCHEMA:
+        raise ValueError("artifact action schema is incompatible")
     return manifest
 
 
@@ -602,11 +717,13 @@ def _parser() -> argparse.ArgumentParser:
     train.add_argument("--epochs", type=int, default=20)
     train.add_argument("--seed", type=int, default=42)
     train.add_argument("--device", default="cpu")
+    train.add_argument("--location", choices=("local", "colab"), required=True)
     train.add_argument("--resume", action="store_true")
+    train.add_argument("--cancel-file", type=Path)
     train.add_argument("--tiny", action="store_true", help="small network and bounded steps")
-    train.add_argument("--min-validation-return", type=float, default=-1.0)
-    train.add_argument("--min-holdout-return", type=float, default=-1.0)
-    train.add_argument("--max-holdout-drawdown", type=float, default=1.0)
+    train.add_argument("--min-validation-return", type=float)
+    train.add_argument("--min-holdout-return", type=float)
+    train.add_argument("--max-holdout-drawdown", type=float)
 
     verify = subparsers.add_parser("verify", help="validate manifest and checksum")
     verify.add_argument("--checkpoint", type=Path, required=True)
@@ -684,13 +801,18 @@ def main(argv: Sequence[str] | None = None) -> int:
     batch_size = 64
     buffer_capacity = 1_000_000
     if args.tiny:
-        model = ModelConfig(gru_hidden=8, macro_embed=4, fc_hidden=8)
+        model = ModelConfig(
+            gru_hidden=8,
+            macro_embed=4,
+            fc_hidden=8,
+            lookback_bars=10,
+        )
         max_steps = 12
         batch_size = 4
         buffer_capacity = 128
     data = (
         synthetic_market_data(
-            bars=180,
+            bars=180 if args.tiny else 1200,
             seed=args.seed,
             lob_dim=model.lob_dim,
             macro_dim=model.macro_dim,
@@ -705,18 +827,36 @@ def main(argv: Sequence[str] | None = None) -> int:
         seed=args.seed,
         max_steps_per_epoch=max_steps,
     )
-    manifest = train_shared(
-        data,
-        args.output_dir,
-        symbol=args.symbol,
-        model=model,
-        training=training,
-        device=args.device,
-        resume=args.resume,
-        min_validation_return=args.min_validation_return,
-        min_holdout_return=args.min_holdout_return,
-        max_holdout_drawdown=args.max_holdout_drawdown,
+    thresholds = (
+        (-1.0, -1.0, 1.0)
+        if args.tiny
+        else (
+            0.0 if args.min_validation_return is None else args.min_validation_return,
+            0.0 if args.min_holdout_return is None else args.min_holdout_return,
+            0.10 if args.max_holdout_drawdown is None else args.max_holdout_drawdown,
+        )
     )
+    try:
+        manifest = train_shared(
+            data,
+            args.output_dir,
+            symbol=args.symbol,
+            model=model,
+            training=training,
+            device=args.device,
+            location=args.location,
+            cancel_path=args.cancel_file,
+            progress=lambda update: print(
+                json.dumps({"progress": update}, sort_keys=True), file=sys.stderr
+            ),
+            resume=args.resume,
+            min_validation_return=thresholds[0],
+            min_holdout_return=thresholds[1],
+            max_holdout_drawdown=thresholds[2],
+        )
+    except (TrainingCancelled, KeyboardInterrupt) as exc:
+        print(f"training canceled: {exc}", file=sys.stderr)
+        return 130
     print(
         json.dumps(
             {

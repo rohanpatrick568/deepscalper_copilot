@@ -155,6 +155,36 @@ class TestBuildObservation:
         assert arr.max() <= 1.1, f"macro max {arr.max()} out of expected range"
         assert arr.min() >= -1.1, f"macro min {arr.min()} out of expected range"
 
+    def test_live_and_training_observations_match_shared_history(self):
+        from colab.deepscalper.environment import ScalperEnv
+        from colab.deepscalper.utils import compute_macro_features, compute_micro_features
+
+        bars = _make_bars(LOOKBACK_BARS + 2)
+        lob = compute_micro_features(bars, use_proxy=True)
+        macro = compute_macro_features(bars)
+        env = ScalperEnv(
+            lob_features=lob,
+            macro_features=macro,
+            close_prices=bars["close"].to_numpy(),
+            day_starts=[0],
+            random_day_reset=False,
+            lookback_bars=LOOKBACK_BARS,
+            training_mode=False,
+        )
+        training_obs, _ = env.reset(options={"day_idx": 0})
+        live_obs = build_observation(
+            bars.iloc[:LOOKBACK_BARS],
+            private_history=np.zeros((LOOKBACK_BARS, 2), dtype=np.float32),
+            lob_override=lob[:LOOKBACK_BARS],
+        )
+        for key in ("lob", "priv", "macro"):
+            np.testing.assert_allclose(
+                live_obs[key].squeeze(0).numpy(),
+                training_obs[key],
+                rtol=0,
+                atol=1e-7,
+            )
+
 
 # ---------------------------------------------------------------------------
 # Tests — build_state_tensor (deprecated backward-compat shim)

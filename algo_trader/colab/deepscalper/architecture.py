@@ -37,7 +37,7 @@ Observation split (must match environment.py / state_builder.py):
 
 Action space (BDQ):
     direction : N_DIR=3    (0=SHORT, 1=FLAT, 2=LONG)
-    size      : N_SIZE=4
+    size      : N_SIZE=1    (fixed pilot sizing; learned size action disabled)
 """
 
 import torch
@@ -48,7 +48,7 @@ _MACRO_DIM  = 11
 _LOB_DIM    = 5
 _PRIV_DIM   = 2
 _N_DIR      = 3
-_N_SIZE     = 4
+_N_SIZE     = 1
 _GRU_HIDDEN = 128
 _MACRO_EMB  = 64
 _FC_HIDDEN  = 128
@@ -289,6 +289,5 @@ class DuelingQNetwork(DeepScalperNet):
             gru_hidden=hidden_size,
             n_dir=action_dim,
         )
-
 
 
