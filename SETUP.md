@@ -19,7 +19,7 @@ This project is now an equities-first DeepScalper stack with TradeMaster-aligned
 
 ## Prerequisites
 
-- Python 3.13+
+- Python 3.12+ (Windows 11 and Colab-supported runtimes)
 - pip 23+
 - Git
 - Alpaca paper account
