@@ -329,7 +329,7 @@ class DeepScalperAgent:
         macro_dim:       int   = 11,
         lob_dim:         int   = 4,
         priv_dim:        int   = 2,
-        n_dir:           int   = 2,
+        n_dir:          int   = 3,
         n_size:          int   = 1,
         gru_hidden:      int   = 128,
         macro_embed:     int   = 64,
@@ -338,7 +338,7 @@ class DeepScalperAgent:
         gamma:           float = 0.9,
         repeat_times:    float = 1.0,
         clip_grad_norm:  float = 3.0,
-        soft_update_tau: float = 0.0,
+        soft_update_tau: float = 0.005,
         state_value_tau: float = 0.005,
         batch_size:      int   = 64,
         buffer_capacity: int   = 1_000_000,
@@ -389,6 +389,19 @@ class DeepScalperAgent:
 
         self.optimizer = optim.Adam(self.online_net.parameters(), lr=lr)
         self.buffer = ReplayBuffer(capacity=buffer_capacity)
+
+    def update_target_network(self) -> None:
+        """Move the target network toward the online network.
+
+        A zero interpolation factor silently froze the target forever.  Keep
+        the operation explicit so tests and callers can verify target changes.
+        """
+        tau = float(self.soft_update_tau)
+        if not 0.0 < tau <= 1.0:
+            raise ValueError(f"soft_update_tau must be in (0, 1], got {tau}")
+        with torch.no_grad():
+            for target, online in zip(self.target_net.parameters(), self.online_net.parameters()):
+                target.mul_(1.0 - tau).add_(online, alpha=tau)
 
     # ------------------------------------------------------------------
     # Hindsight bonus reward — Section 4.2
@@ -526,12 +539,7 @@ class DeepScalperAgent:
         loss.backward()
         nn.utils.clip_grad_norm_(self.online_net.parameters(), max_norm=self.clip_grad_norm)
         self.optimizer.step()
-
-        # -- Soft target update --
-        for online_p, target_p in zip(self.online_net.parameters(), self.target_net.parameters()):
-            target_p.data.copy_(
-                self.soft_update_tau * online_p.data + (1.0 - self.soft_update_tau) * target_p.data
-            )
+        self.update_target_network()
 
         return float(loss.item())
 

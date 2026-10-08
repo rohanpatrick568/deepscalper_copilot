@@ -20,7 +20,7 @@ Usage:
 """
 
 import logging
-from typing import Optional
+from typing import Optional, Sequence
 
 import numpy as np
 import torch
@@ -35,6 +35,7 @@ def build_observation(
     bars,
     position:            int   = 0,
     unrealized_pnl_pct:  float = 0.0,
+    private_history: Optional[Sequence[Sequence[float]]] = None,
     lob_override: Optional[np.ndarray] = None,
     device:              str   = "cpu",
 ) -> dict:
@@ -88,11 +89,23 @@ def build_observation(
         lob_seq   = np.vstack([np.zeros((pad_len, LOB_DIM),   dtype=np.float32), lob_seq])
 
     # ---- Private state sequence ----
-    # For live inference we only have the current state; replicate it across the window.
-    pos_flag  = float(np.clip(position, -1, 1))
-    pnl_clamp = float(np.clip(unrealized_pnl_pct, -0.5, 0.5))
-    priv_vec  = np.array([pos_flag, pnl_clamp], dtype=np.float32)
-    priv_seq  = np.tile(priv_vec, (seq_len, 1))   # (seq_len, 2)
+    # Preserve causal private history when available.  Repeating today's state
+    # over historical bars leaks future position/P&L into the observation.
+    if private_history is None:
+        pos_flag = float(np.clip(position, -1, 1))
+        pnl_clamp = float(np.clip(unrealized_pnl_pct, -0.5, 0.5))
+        priv_seq = np.tile(np.array([pos_flag, pnl_clamp], dtype=np.float32), (seq_len, 1))
+    else:
+        priv_seq = np.asarray(private_history, dtype=np.float32)
+        if priv_seq.ndim != 2 or priv_seq.shape[1] != 2:
+            raise ValueError("private_history must have shape (n, 2)")
+        priv_seq = np.clip(priv_seq, [-1.0, -0.5], [1.0, 0.5])
+        priv_seq = priv_seq[-seq_len:]
+        if len(priv_seq) < seq_len:
+            priv_seq = np.vstack([
+                np.zeros((seq_len - len(priv_seq), 2), dtype=np.float32),
+                priv_seq,
+            ])
 
     # ---- Macro: use only the current bar's features (no time dimension) ----
     macro_current = macro_seq[-1]  # (11,)

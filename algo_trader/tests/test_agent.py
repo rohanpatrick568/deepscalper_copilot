@@ -46,12 +46,24 @@ def _make_agent(n_dir: int = N_DIR, lob_dim: int = LOB_DIM, buffer_capacity: int
         macro_dim=11, lob_dim=lob_dim, priv_dim=2,
         n_dir=n_dir, n_size=N_SIZE,
         gru_hidden=16, macro_embed=8, fc_hidden=16,
-        lr=1e-3, gamma=0.9, soft_update_tau=0.0,
+        lr=1e-3, gamma=0.9, soft_update_tau=0.005,
         repeat_times=1.0, clip_grad_norm=3.0,
         batch_size=8,
         buffer_capacity=buffer_capacity,
         explore_rate=0.25,
         device="cpu",
+    )
+
+
+def test_target_network_updates():
+    agent = _make_agent()
+    before = [param.detach().clone() for param in agent.target_net.parameters()]
+    with torch.no_grad():
+        next(agent.online_net.parameters()).add_(1.0)
+    agent.update_target_network()
+    assert any(
+        not torch.equal(old, new)
+        for old, new in zip(before, agent.target_net.parameters())
     )
 
 

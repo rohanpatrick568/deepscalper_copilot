@@ -139,6 +139,14 @@ class TestBuildObservation:
         pnl_val = obs["priv"][0, 0, 1].item()
         assert pnl_val <= 0.5 + 1e-6
 
+    def test_private_history_is_not_repeated(self):
+        bars = _make_bars(LOOKBACK_BARS + 5)
+        obs = build_observation(
+            bars,
+            private_history=[[0.0, 0.0], [1.0, 0.1], [1.0, 0.2]],
+        )
+        assert obs["priv"][0, -3:, 0].tolist() == [0.0, 1.0, 1.0]
+
     def test_macro_values_bounded(self):
         """All macro features should be in a reasonable normalised range."""
         bars = _make_bars(LOOKBACK_BARS + 50)

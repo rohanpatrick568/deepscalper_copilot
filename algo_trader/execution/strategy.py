@@ -49,6 +49,13 @@ from config import (
     TRAILING_STOP_FLOOR_PCT,
     USE_VOLATILITY_SIZING,
     TARGET_ENTRY_RISK_PCT,
+    MAX_ORDER_NOTIONAL,
+    MAX_SYMBOL_NOTIONAL,
+    MAX_TOTAL_NOTIONAL,
+    RUN_MODE,
+    DATA_FEED,
+    LONG_ONLY,
+    ALLOW_PYRAMIDING,
     MIN_POSITION_SCALE,
     MAX_POSITION_SCALE,
     CLOSE_ALL_EOD,
@@ -59,8 +66,14 @@ from config import (
 )
 from dashboard.data_bridge import DataBridge, ModelSignal, PositionSnapshot, TradeEvent
 from execution.circuit_breakers import CircuitBreaker
-from execution.risk import calculate_atr_stop, kelly_position_size
+from execution.risk import (
+    calculate_atr_stop,
+    capped_entry_quantity,
+    kelly_position_size,
+    weighted_fill_price,
+)
 from execution.state_builder import build_observation
+from execution.validation import validate_bars
 
 _COLAB_PATH = Path(__file__).parent.parent / "colab"
 if str(_COLAB_PATH) not in sys.path:
@@ -114,6 +127,8 @@ class EquityDeepScalper(Strategy):
         self._iteration_index: int = 0
         self._entry_iteration: Dict[str, int] = {}
         self._last_exit_iteration: Dict[str, int] = {}
+        self._exit_iteration: Dict[str, int] = {}
+        self._order_state: Dict[str, dict] = {}
 
         self._tz = pytz.timezone(MARKET_TIMEZONE)
 
@@ -186,23 +201,38 @@ class EquityDeepScalper(Strategy):
         symbol = str(order.asset.symbol)
         side = str(order.side).lower()
         qty = abs(float(quantity))
+        fill_price = float(price)
 
         self._push_event("FILL", symbol, qty, float(price), side.upper())
 
         existing_side = self._entry_side.get(symbol)
         trade_pnl = None
 
+        pending = self._order_state.get(symbol)
+        if pending and pending.get("side") == side:
+            pending["qty"] = max(0.0, float(pending.get("qty", 0.0)) - qty)
+            if pending["qty"] == 0:
+                self._order_state.pop(symbol, None)
+
         if existing_side == "buy" and side == "sell":
-            entry = self._entry_prices.get(symbol, float(price))
+            entry = self._entry_prices.get(symbol, fill_price)
             trade_pnl = (float(price) - entry) * qty
-            self._clear_symbol_state(symbol)
+            if not position or abs(float(getattr(position, "quantity", 0.0))) <= 0:
+                self._clear_symbol_state(symbol)
         elif existing_side == "sell" and side == "buy":
-            entry = self._entry_prices.get(symbol, float(price))
+            entry = self._entry_prices.get(symbol, fill_price)
             trade_pnl = (entry - float(price)) * qty
-            self._clear_symbol_state(symbol)
+            if not position or abs(float(getattr(position, "quantity", 0.0))) <= 0:
+                self._clear_symbol_state(symbol)
         elif existing_side is None:
             self._entry_side[symbol] = side
-            self._entry_prices[symbol] = float(price)
+            old_qty = float(getattr(position, "quantity", 0.0)) - qty if position else 0.0
+            old_price = self._entry_prices.get(symbol, fill_price)
+            total_qty = abs(old_qty) + qty
+            self._entry_prices[symbol] = (
+                weighted_fill_price(abs(old_qty), old_price, qty, fill_price)
+                if total_qty and old_qty > 0 else fill_price
+            )
 
         if trade_pnl is not None:
             is_win = trade_pnl > 0
@@ -269,7 +299,20 @@ class EquityDeepScalper(Strategy):
 
         bars = bars_obj.df
         if len(bars) < LOOKBACK_BARS:
+            logger.info("Skipping %s: only %d/%d bars", symbol, len(bars), LOOKBACK_BARS)
             return
+        valid, reason = validate_bars(bars, now=pd.Timestamp.now(tz="UTC"))
+        if not valid:
+            logger.info("Skipping %s: %s", symbol, reason)
+            return
+        bar_timestamp = bars.index[-1]
+        if getattr(self, "_last_bar_timestamp", {}).get(symbol) == bar_timestamp:
+            logger.info("Skipping %s: bar %s already processed", symbol, bar_timestamp)
+            return
+        if not hasattr(self, "_last_bar_timestamp"):
+            self._last_bar_timestamp = {}
+        self._last_bar_timestamp[symbol] = bar_timestamp
+        logger.info("Processing %s bar=%s feed=%s", symbol, bar_timestamp, DATA_FEED)
 
         pos_obj = current_positions.get(symbol)
         position_flag = 0
@@ -312,15 +355,18 @@ class EquityDeepScalper(Strategy):
         long_entry_allowed = (q_long - q_flat) > self._ENTRY_Q_EDGE_MIN and confidence >= self._ENTRY_CONFIDENCE_MIN
         short_entry_allowed = (q_short - q_flat) > self._ENTRY_Q_EDGE_MIN and confidence >= self._ENTRY_CONFIDENCE_MIN
 
+        risk_exit_submitted = False
         if position_flag != 0:
             if position_flag == 1:
                 self._peak_prices[symbol] = max(self._peak_prices.get(symbol, current_price), current_price)
-                self._risk_exit_check(symbol, asset, bars, current_price, side="buy")
+                risk_exit_submitted = self._risk_exit_check(symbol, asset, bars, current_price, side="buy")
             else:
                 self._trough_prices[symbol] = min(self._trough_prices.get(symbol, current_price), current_price)
-                self._risk_exit_check(symbol, asset, bars, current_price, side="sell")
+                risk_exit_submitted = self._risk_exit_check(symbol, asset, bars, current_price, side="sell")
 
         self._publish_signal(symbol, action, q_np.tolist(), confidence)
+        if risk_exit_submitted:
+            return
 
         hold_bars = self._holding_bars(symbol)
         in_cooldown = self._in_entry_cooldown(symbol)
@@ -332,7 +378,7 @@ class EquityDeepScalper(Strategy):
                 if hold_bars >= MIN_HOLD_BARS:
                     self._submit_exit_flat(symbol, asset, current_price, reason="REVERSE_TO_LONG")
                 return
-            if not in_cooldown and long_entry_allowed:
+            if not in_cooldown and long_entry_allowed and (LONG_ONLY or not ALLOW_PYRAMIDING):
                 self._submit_entry(symbol, asset, bars, current_price, portfolio_value, side="buy")
 
         elif action == ACTION_SHORT:
@@ -342,7 +388,7 @@ class EquityDeepScalper(Strategy):
                 if hold_bars >= MIN_HOLD_BARS:
                     self._submit_exit_flat(symbol, asset, current_price, reason="REVERSE_TO_SHORT")
                 return
-            if not in_cooldown and short_entry_allowed:
+            if not LONG_ONLY and not in_cooldown and short_entry_allowed:
                 self._submit_entry(symbol, asset, bars, current_price, portfolio_value, side="sell")
 
         else:  # ACTION_FLAT
@@ -389,13 +435,28 @@ class EquityDeepScalper(Strategy):
                 stop_risk_pct = max((stop_price - current_price) / max(current_price, 1e-9), 1e-9)
             raw_scale = TARGET_ENTRY_RISK_PCT / stop_risk_pct
             scale = float(np.clip(raw_scale, MIN_POSITION_SCALE, MAX_POSITION_SCALE))
-            qty = max(1, int(qty * scale))
+            qty = int(qty * scale)
 
-        if qty <= 0:
+        qty = capped_entry_quantity(
+            qty,
+            current_price,
+            symbol_notional=0.0,
+            aggregate_notional=0.0,
+            pending_notional=sum(float(state.get("qty", 0)) * current_price for state in self._order_state.values()),
+            order_cap=MAX_ORDER_NOTIONAL,
+            symbol_cap=MAX_SYMBOL_NOTIONAL,
+            aggregate_cap=MAX_TOTAL_NOTIONAL,
+        )
+        notional = qty * current_price
+        if qty <= 0 or notional > MAX_ORDER_NOTIONAL:
+            logger.info("Skipping %s entry: quantity/notional outside cap", symbol)
             return
 
         try:
             order = self.create_order(asset, qty, side)
+            if RUN_MODE in {"offline", "dry-run", "preflight"}:
+                logger.info("NO ORDER (%s): %s %d %s", RUN_MODE, side, qty, symbol)
+                return
             self.submit_order(order)
             self._entry_iteration[symbol] = self._iteration_index
             self._entry_side[symbol] = side
@@ -419,6 +480,12 @@ class EquityDeepScalper(Strategy):
             logger.error("Failed to submit %s for %s: %s", side.upper(), symbol, exc)
 
     def _submit_exit_flat(self, symbol: str, asset: Asset, current_price: float, reason: str) -> None:
+        if self._exit_iteration.get(symbol) == self._iteration_index:
+            logger.info("Skipping duplicate exit for %s in iteration %d", symbol, self._iteration_index)
+            return
+        if self._order_state.get(symbol, {}).get("exit_pending"):
+            logger.info("Exit already pending for %s", symbol)
+            return
         try:
             position = self.get_position(asset)
             if not position:
@@ -428,7 +495,12 @@ class EquityDeepScalper(Strategy):
                 return
             side = "sell" if qty > 0 else "buy"
             order = self.create_order(asset, abs(qty), side)
+            if RUN_MODE in {"offline", "dry-run", "preflight"}:
+                logger.info("NO ORDER (%s): EXIT %.2f %s", RUN_MODE, abs(qty), symbol)
+                return
             self.submit_order(order)
+            self._order_state[symbol] = {"exit_pending": True, "qty": abs(qty), "side": side}
+            self._exit_iteration[symbol] = self._iteration_index
             self._last_exit_iteration[symbol] = self._iteration_index
             self._entry_iteration.pop(symbol, None)
             self._peak_prices.pop(symbol, None)
@@ -439,7 +511,7 @@ class EquityDeepScalper(Strategy):
         except Exception as exc:
             logger.error("Failed to submit EXIT for %s: %s", symbol, exc)
 
-    def _risk_exit_check(self, symbol: str, asset: Asset, bars: pd.DataFrame, current_price: float, side: str) -> None:
+    def _risk_exit_check(self, symbol: str, asset: Asset, bars: pd.DataFrame, current_price: float, side: str) -> bool:
         active_stop = self._stop_prices.get(symbol, 0.0)
         active_tp = self._tp_prices.get(symbol, 0.0)
 
@@ -454,18 +526,23 @@ class EquityDeepScalper(Strategy):
 
         if side == "buy":
             if active_stop > 0 and current_price <= active_stop:
+                before = self._exit_iteration.get(symbol)
                 self._submit_exit_flat(symbol, asset, current_price, reason="RISK_STOP")
-                return
+                return before != self._exit_iteration.get(symbol)
             if active_tp > 0 and current_price >= active_tp:
+                before = self._exit_iteration.get(symbol)
                 self._submit_exit_flat(symbol, asset, current_price, reason="TAKE_PROFIT")
-                return
+                return before != self._exit_iteration.get(symbol)
         else:
             if active_stop > 0 and current_price >= active_stop:
+                before = self._exit_iteration.get(symbol)
                 self._submit_exit_flat(symbol, asset, current_price, reason="RISK_STOP")
-                return
+                return before != self._exit_iteration.get(symbol)
             if active_tp > 0 and current_price <= active_tp:
+                before = self._exit_iteration.get(symbol)
                 self._submit_exit_flat(symbol, asset, current_price, reason="TAKE_PROFIT")
-                return
+                return before != self._exit_iteration.get(symbol)
+        return False
 
     def _holding_bars(self, symbol: str) -> int:
         entry_iter = self._entry_iteration.get(symbol)

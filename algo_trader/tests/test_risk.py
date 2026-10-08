@@ -16,7 +16,7 @@ from pathlib import Path
 # Add project root to path so imports resolve without an installed package
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from execution.risk import kelly_position_size, calculate_atr_stop
+from execution.risk import kelly_position_size, calculate_atr_stop, weighted_fill_price
 
 
 # ---------------------------------------------------------------------------
@@ -56,21 +56,21 @@ class TestKellyPositionSize:
         max_allowed_notional = 100_000 * 0.03
         assert qty * 10.0 <= max_allowed_notional + 10.0   # Allow one share rounding
 
-    def test_minimum_one_share(self):
-        """Even with tiny portfolio or high price, at least 1 share is returned."""
+    def test_insufficient_allocation_returns_zero(self):
+        """A position over the allocation budget is skipped."""
         qty = kelly_position_size(
             win_rate=0.51, avg_win=0.001, avg_loss=0.001,
             portfolio_value=100, price=5_000.0,
         )
-        assert qty == 1
+        assert qty == 0
 
-    def test_negative_kelly_returns_one(self):
-        """Negative Kelly (edge < 0) should not return 0 or negative."""
+    def test_negative_kelly_returns_zero(self):
+        """Negative Kelly (edge < 0) must not create an order."""
         qty = kelly_position_size(
             win_rate=0.1, avg_win=0.01, avg_loss=0.50,   # Terrible edge
             portfolio_value=10_000, price=50.0,
         )
-        assert qty == 1
+        assert qty == 0
 
     def test_kelly_fraction_scales_down(self):
         """Applying a 0.5 Kelly fraction should produce fewer shares than full Kelly."""
@@ -81,6 +81,9 @@ class TestKellyPositionSize:
         qty_half = kelly_position_size(**kwargs, kelly_fraction=0.5)
         qty_full = kelly_position_size(**kwargs, kelly_fraction=1.0)
         assert qty_half <= qty_full
+
+    def test_fill_price_uses_actual_weighted_fill(self):
+        assert weighted_fill_price(5, 100.0, 5, 102.0) == 101.0
 
 
 # ---------------------------------------------------------------------------

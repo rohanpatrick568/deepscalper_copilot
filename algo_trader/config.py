@@ -38,14 +38,19 @@ os.environ["MARKET"] = "NYSE"
 # Imported lazily by other modules via tickers.py to avoid circular imports.
 # Reproduced here as a reference; the canonical list lives in tickers.py.
 
-# Equity rollout universe (pilot subset for safer staged deployment)
-TRADING_UNIVERSE: list = SP100_TICKERS[:10]
+# One canonical, deliberately bounded pilot universe.  Expand only by changing
+# this setting and retraining/exporting compatible manifests.
+TRADING_UNIVERSE: list[str] = ["AAPL"]
+TRAINING_UNIVERSE: list[str] = TRADING_UNIVERSE.copy()
 CRYPTO_PAIRS: list = []  # Backward-compat alias (deprecated)
 
 # ---------------------------------------------------------------------------
 # Execution Parameters
 # ---------------------------------------------------------------------------
 CANDLE_TIMEFRAME: str = "1Min"   # Lumibot timestep identifier
+DATA_FEED: str = os.getenv("ALPACA_DATA_FEED", "iex").lower()
+DATA_ADJUSTMENT: str = os.getenv("ALPACA_ADJUSTMENT", "raw").lower()
+DATA_DELAY_MAX_SECONDS: int = int(os.getenv("DATA_DELAY_MAX_SECONDS", "120"))
 LOOKBACK_BARS: int = 60          # Paper-aligned observation lookback
 SLEEP_TIME: str = "1M"           # Lumibot on_trading_iteration frequency
 
@@ -58,6 +63,11 @@ ATR_PERIOD: int = 14                  # Periods for ATR calculation
 ATR_STOP_MULTIPLIER: float = 2.0      # Stop-loss = entry ± (ATR × multiplier)
 ATR_TP_MULTIPLIER: float = 4.0        # Take-profit = entry ± (ATR × TP multiplier)
 MAX_POSITION_PCT: float = 0.03        # Paper-aligned max position cap
+MAX_ORDER_NOTIONAL: float = float(os.getenv("MAX_ORDER_NOTIONAL", "30.0"))
+MAX_SYMBOL_NOTIONAL: float = float(os.getenv("MAX_SYMBOL_NOTIONAL", "100.0"))
+MAX_TOTAL_NOTIONAL: float = float(os.getenv("MAX_TOTAL_NOTIONAL", "250.0"))
+LONG_ONLY: bool = True
+ALLOW_PYRAMIDING: bool = False
 
 # Trade frequency and exit control (live execution)
 MIN_HOLD_BARS: int = 3                # Minimum bars to hold after entry before model-driven exit
@@ -97,7 +107,12 @@ MARKET_TIMEZONE: str = "US/Eastern"
 # ---------------------------------------------------------------------------
 # Model Architecture  (DeepScalper paper — CIKM '22, Sun et al.)
 # ---------------------------------------------------------------------------
-WEIGHTS_DIR: Path = Path("./weights/")   # Local directory containing .pth weight files
+PROJECT_ROOT: Path = Path(__file__).resolve().parent
+WEIGHTS_DIR: Path = Path(os.getenv("WEIGHTS_DIR", str(PROJECT_ROOT / "weights"))).expanduser().resolve()
+DATA_DIR: Path = Path(os.getenv("DATA_DIR", str(PROJECT_ROOT / "data"))).expanduser().resolve()
+RUN_MODE: str = os.getenv("ALGO_TRADER_RUN_MODE", "preflight").strip().lower()
+NO_ORDER_MODES = {"preflight", "dry-run", "offline"}
+PAPER_ONLY: bool = True
 
 # --- Observation dimensions ---
 MACRO_DIM: int = 11    # Macro features: z_open/high/low/close/adj + z_d_5..30 (Table 2)
@@ -141,7 +156,7 @@ LEARNING_RATE: float = 1e-3
 GAMMA: float = 0.9
 REPEAT_TIMES: float = 1.0
 CLIP_GRAD_NORM: float = 3.0
-SOFT_UPDATE_TAU: float = 0.0
+SOFT_UPDATE_TAU: float = float(os.getenv("SOFT_UPDATE_TAU", "0.005"))
 STATE_VALUE_TAU: float = 0.005
 EXPLORE_RATE: float = 0.25
 

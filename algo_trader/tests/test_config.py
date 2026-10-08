@@ -170,7 +170,7 @@ class TestTradeMasterTrainingBlock:
         assert abs(config.CLIP_GRAD_NORM - 3.0) < 1e-12
 
     def test_soft_update_tau_match_trademaster(self):
-        assert abs(config.SOFT_UPDATE_TAU - 0.0) < 1e-12
+        assert 0.0 < config.SOFT_UPDATE_TAU <= 1.0
 
     def test_state_value_tau_match_trademaster(self):
         assert abs(config.STATE_VALUE_TAU - 0.005) < 1e-12

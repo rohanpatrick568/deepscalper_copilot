@@ -27,6 +27,36 @@ from config import (
 logger = logging.getLogger(__name__)
 
 
+def weighted_fill_price(existing_qty: float, existing_price: float, fill_qty: float, fill_price: float) -> float:
+    """Return the quantity-weighted average price after an additional fill."""
+    if existing_qty < 0 or fill_qty <= 0 or existing_price <= 0 or fill_price <= 0:
+        raise ValueError("quantities and prices must be positive for weighted fills")
+    total = existing_qty + fill_qty
+    return (existing_qty * existing_price + fill_qty * fill_price) / total
+
+
+def capped_entry_quantity(
+    requested_qty: int,
+    price: float,
+    symbol_notional: float,
+    aggregate_notional: float,
+    pending_notional: float = 0.0,
+    *,
+    order_cap: float,
+    symbol_cap: float,
+    aggregate_cap: float,
+) -> int:
+    """Apply pending-aware order, symbol, and aggregate notional caps."""
+    if requested_qty <= 0 or price <= 0:
+        return 0
+    available = min(
+        order_cap,
+        symbol_cap - max(0.0, symbol_notional),
+        aggregate_cap - max(0.0, aggregate_notional) - max(0.0, pending_notional),
+    )
+    return max(0, min(int(requested_qty), int(available / price)))
+
+
 # ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
@@ -105,18 +135,19 @@ def kelly_position_size(
         max_position_pct: Maximum fraction of portfolio for this position (default MAX_POSITION_PCT).
 
     Returns:
-        Integer number of shares to purchase (minimum 1).
+        Integer number of shares. Zero means the input or allocation cannot
+        support a valid order.
     """
     if avg_loss <= 0 or avg_win <= 0 or portfolio_value <= 0 or price <= 0:
         logger.warning(
             "kelly_position_size received invalid inputs: "
-            "avg_win=%.4f avg_loss=%.4f portfolio=%.2f price=%.2f — returning 1 share",
+            "avg_win=%.4f avg_loss=%.4f portfolio=%.2f price=%.2f — returning 0 shares",
             avg_win,
             avg_loss,
             portfolio_value,
             price,
         )
-        return 1
+        return 0
 
     # Clamp win_rate to a sensible range to avoid degenerate Kelly fractions
     win_rate = float(np.clip(win_rate, 0.01, 0.99))
@@ -127,9 +158,9 @@ def kelly_position_size(
     raw_kelly = (win_rate * payoff_ratio - lose_rate) / payoff_ratio
 
     if raw_kelly <= 0:
-        # Negative Kelly → edge is too thin; take minimum position
-        logger.debug("Kelly fraction is negative (%.4f) — sizing to 1 share", raw_kelly)
-        return 1
+        # Negative Kelly means there is no risk budget for an entry.
+        logger.debug("Kelly fraction is negative (%.4f) — sizing to 0 shares", raw_kelly)
+        return 0
 
     # Apply fractional Kelly and max-position cap
     kelly_dollars = raw_kelly * kelly_fraction * portfolio_value
@@ -137,7 +168,9 @@ def kelly_position_size(
     position_dollars = min(kelly_dollars, max_dollars)
 
     shares = int(position_dollars / price)
-    shares = max(1, shares)  # Enforce minimum of 1 share
+    if shares <= 0:
+        logger.info("Allocation $%.2f cannot buy one share at $%.2f", position_dollars, price)
+        return 0
 
     logger.debug(
         "Kelly sizing: win_rate=%.2f payoff=%.2f raw_f=%.4f "

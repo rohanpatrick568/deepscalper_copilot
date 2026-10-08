@@ -14,7 +14,7 @@ import logging
 
 from lumibot.brokers import Alpaca
 
-from config import ALPACA_API_KEY, ALPACA_SECRET_KEY
+from config import ALPACA_API_KEY, ALPACA_SECRET_KEY, ALPACA_DATA_URL, DATA_FEED, DATA_ADJUSTMENT, PAPER_ONLY
 
 logger = logging.getLogger(__name__)
 
@@ -27,6 +27,9 @@ ALPACA_CONFIG: dict = {
     "API_SECRET": ALPACA_SECRET_KEY,
     "MARKET": "NYSE",
     "PAPER": True,   # Always True — this system is paper-trading only
+    "DATA_FEED": DATA_FEED,
+    "ADJUSTMENT": DATA_ADJUSTMENT,
+    "DATA_URL": ALPACA_DATA_URL,
 }
 
 
@@ -42,6 +45,8 @@ def get_broker() -> Alpaca:
     Raises:
         RuntimeError: If ALPACA_API_KEY or ALPACA_SECRET_KEY are empty strings.
     """
+    if not PAPER_ONLY:
+        raise RuntimeError("Refusing to create a non-paper broker")
     if not ALPACA_API_KEY or not ALPACA_SECRET_KEY:
         raise RuntimeError(
             "Alpaca API credentials are missing. "

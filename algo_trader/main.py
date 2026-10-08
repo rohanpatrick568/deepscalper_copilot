@@ -46,7 +46,18 @@ def _validate_environment() -> None:
     Raises:
         SystemExit: On any validation failure.
     """
-    from config import ALPACA_API_KEY, ALPACA_SECRET_KEY, TRADING_UNIVERSE, WEIGHTS_DIR
+    from config import ALPACA_API_KEY, ALPACA_SECRET_KEY, RUN_MODE, TRADING_UNIVERSE, WEIGHTS_DIR
+    from execution.validation import validate_startup_configuration
+
+    try:
+        validate_startup_configuration(TRADING_UNIVERSE, WEIGHTS_DIR)
+    except (FileNotFoundError, ValueError) as exc:
+        logger.critical("Configuration/checkpoint validation failed: %s", exc)
+        sys.exit(1)
+
+    if RUN_MODE in {"offline", "dry-run"}:
+        logger.info("No-order mode %s: broker order submission is disabled.", RUN_MODE)
+        return
 
     # 1. Credentials check
     if not ALPACA_API_KEY or not ALPACA_SECRET_KEY:
@@ -70,23 +81,7 @@ def _validate_environment() -> None:
         logger.critical("Alpaca credential verification failed: %s — aborting.", exc)
         sys.exit(1)
 
-    # 3. Weight files check (one file per configured symbol)
-    missing = [
-        symbol
-        for symbol in TRADING_UNIVERSE
-        if not (WEIGHTS_DIR / f"{symbol.replace('/', '_')}.pth").exists()
-    ]
-    if missing:
-        logger.critical(
-            "%d weight file(s) missing from %s:\n  %s\n\n"
-            "Run the Colab training pipeline first (notebooks 01→04).",
-            len(missing),
-            WEIGHTS_DIR,
-            ", ".join(missing),
-        )
-        sys.exit(1)
-
-    logger.info("All %d symbol weight file(s) verified ✓", len(TRADING_UNIVERSE))
+    logger.info("All %d symbol checkpoint(s) verified.", len(TRADING_UNIVERSE))
 
 
 def _run_lumibot(bridge) -> None:

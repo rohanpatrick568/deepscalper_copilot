@@ -61,6 +61,8 @@ logger = logging.getLogger(__name__)
 _SHORT = 0
 _FLAT = 1
 _LONG = 2
+ACTION_TO_POSITION = {_SHORT: -1, _FLAT: 0, _LONG: 1}
+POSITION_TO_ACTION = {-1: _SHORT, 0: _FLAT, 1: _LONG}
 
 # Alpaca crypto taker fee guidance (volume-tiered): 12–25 bps.
 MIN_TAKER_FEE_PCT = 0.0012
@@ -245,14 +247,9 @@ class ScalperEnv(gym.Env):
 
         prev_position = self._position
 
-        if action == _SHORT:
-            new_position = -1
-        elif action == _FLAT:
-            new_position = 0
-        elif action == _LONG:
-            new_position = 1
-        else:
+        if action not in ACTION_TO_POSITION:
             raise ValueError(f"Invalid action {action}")
+        new_position = ACTION_TO_POSITION[action]
 
         turnover = abs(new_position - prev_position)
         trade_occurred = turnover > 0
