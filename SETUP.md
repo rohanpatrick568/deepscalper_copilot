@@ -1,179 +1,172 @@
-# DeepScalper Copilot Setup Guide
+# DeepScalper supervised paper setup
 
-This project is now an equities-first DeepScalper stack with TradeMaster-aligned DQN training controls.
+DeepScalper is paper-only. The bounded pilot universe is `AAPL`, execution is
+long-only without pyramiding, and the model size branch is disabled in favor
+of fixed risk-capped sizing.
 
-## Current System Summary
+## 1. Windows 11 setup
 
-- Market mode: US equities (paper trading only)
-- Action semantics: 3-direction policy (SHORT, FLAT, LONG)
-- Live strategy class: EquityDeepScalper
-- Agent training core: TradeMaster-style controls (uniform replay default, repeat_times, clip_grad_norm, soft_update_tau, state_value_tau, static explore_rate)
-- Canonical training constants in config.py:
-  - EPOCHS = 20
-  - HORIZON_LEN = 128
-  - BUFFER_SIZE = 1_000_000
-  - LEARNING_RATE = 1e-3
-  - GAMMA = 0.9
-  - REPEAT_TIMES = 1.0
-  - EXPLORE_RATE = 0.25
-
-## Prerequisites
-
-- Python 3.12+ (Windows 11 and Colab-supported runtimes)
-- pip 23+
-- Git
-- Alpaca paper account
-
-## Install
+Use 64-bit Python 3.12:
 
 ```powershell
-cd deepscalper_copilot
-python -m venv .venv
-.\.venv\Scripts\Activate.ps1
-python -m pip install --upgrade pip
-pip install -r algo_trader/requirements.txt
+git clone https://github.com/rohanpatrick568/deepscalper_copilot.git
+cd .\deepscalper_copilot
+py -3.12 -m venv .venv
+& .\.venv\Scripts\python.exe -m pip install --upgrade pip
+& .\.venv\Scripts\python.exe -m pip install -r .\algo_trader\requirements.txt
+& .\.venv\Scripts\python.exe -m pip check
+Copy-Item .\algo_trader\.env.example .\algo_trader\.env
 ```
 
-## Configure Environment
+Fill only Alpaca **paper** credentials in `.env`. Keep `ALPACA_DATA_FEED=iex`
+unless the account is entitled to SIP. Runtime paths resolve from
+[`algo_trader/`](algo_trader/), not the shell working directory.
 
-Create algo_trader/.env:
+## 2. Offline validation
 
-```env
-ALPACA_API_KEY=YOUR_PAPER_KEY
-ALPACA_SECRET_KEY=YOUR_PAPER_SECRET
-ALPACA_DATA_FEED=iex
-ALPACA_ADJUSTMENT=raw
-ALGO_TRADER_RUN_MODE=preflight
-```
-
-Copy [algo_trader/.env.example](algo_trader/.env.example) rather than
-inventing variable names. The default universe is one symbol (`AAPL`) and all
-paths resolve from the project, not the current working directory.
-
-Notes:
-
-- main.py validates keys and account connectivity before startup.
-- execution/broker.py enforces PAPER=True and the configured feed/adjustment.
-- A missing or incompatible checkpoint fails startup with the symbol and path.
-
-## Training Pipeline (Colab)
-
-Run notebooks in order:
-
-1. colab/01_fetch_training_data.ipynb
-2. colab/02_feature_engineering.ipynb
-3. colab/03_train_deepscalper.ipynb
-4. colab/04_export_and_push_weights.ipynb
-5. colab/05_backtest_validation.ipynb
-6. colab/06_sharpe_diagnosis.ipynb
-7. colab/07_lob_recorder.ipynb (optional data utility)
-
-Key parity notes for training:
-
-- Notebook 03 is wired to canonical keys: epochs, buffer_size, horizon_len, repeat_times, soft_update_tau, state_value_tau, explore_rate.
-- Agent update cadence uses agent.update_net().
-- Active training flow no longer uses auxiliary volatility loss.
-
-## Weights
-
-Weights are expected in algo_trader/weights as one file per configured symbol:
-
-```text
-{SYMBOL}.pth
-```
-
-Example for AAPL:
-
-```text
-AAPL.pth
-```
-
-## Safe operational workflow
-
-All commands below are PowerShell commands and do not place orders unless the
-explicit smoke-test mode is selected:
+This command uses synthetic data and requires no credentials or network:
 
 ```powershell
 cd .\algo_trader
-python -m workflow offline       # local artifacts, no network/orders
-python -m workflow preflight     # read-only account/data/calendar inspection
-$env:ALGO_TRADER_RUN_MODE="dry-run"
-python main.py                   # model path, broker boundary rejects orders
+& ..\.venv\Scripts\python.exe -m workflow offline
+& ..\.venv\Scripts\python.exe -m workflow dry-run
 ```
 
-For the supervised paper smoke test, use a separate paper account, confirm
-preflight output, and set the bounded mode explicitly:
+`dry-run` executes a real strategy decision and creates an in-memory order,
+while the broker boundary remains untouched.
+
+## 3. Read-only Alpaca preflight
 
 ```powershell
-$env:ALGO_TRADER_RUN_MODE="paper-smoke"
-python main.py
+& ..\.venv\Scripts\python.exe -m workflow preflight
 ```
 
-`paper-smoke` is intentionally not a default. Keep the dashboard open and
-stop after the bounded test window; never use live credentials.
+Preflight reads the paper account status, blocks, buying power, positions,
+open orders, broker clock/calendar, AAPL eligibility, configured feed access,
+and actual completed-bar freshness. It reports model readiness separately and
+never submits, replaces, cancels, or closes an order.
 
-Normal model-driven paper mode:
+## 4. Explicit bounded paper round trip
+
+Use a supervised paper account and first confirm preflight reports no AAPL
+position or open AAPL order:
 
 ```powershell
-$env:ALGO_TRADER_RUN_MODE="paper"
-python main.py
+& ..\.venv\Scripts\python.exe -m workflow paper-smoke `
+  --confirm-paper-smoke `
+  --symbol AAPL `
+  --notional 20 `
+  --max-orders 2 `
+  --timeout-seconds 120
 ```
 
-Startup behavior:
+This model-independent command verifies the paper endpoint, buys at most the
+configured notional using one fractional market order, sells exactly the
+reconciled test quantity with one order, and succeeds only after Alpaca
+confirms AAPL flat and both test orders terminal. It refuses dirty AAPL state
+and leaves unrelated symbols untouched.
 
-1. Validate .env credentials and Alpaca paper account
-2. Validate checkpoint compatibility for the canonical universe
-3. Start Lumibot engine thread
-4. Start PyQt dashboard
+## 5. Local training and evaluation
 
-Optional headless mode:
+Core training supports Windows CPU. Set `--device cuda` only when the installed
+PyTorch build and hardware report CUDA support; the selected device is recorded
+and is never changed silently.
+
+Prepare a portable feature file from chronological raw AAPL minute bars:
 
 ```powershell
-$env:ALGO_TRADER_HEADLESS="1"
-python main.py
+& ..\.venv\Scripts\python.exe -m colab.deepscalper.data features `
+  --input .\data\AAPL_raw.parquet `
+  --output .\data\AAPL_features.npz
 ```
 
-## Local or Google Colab training/evaluation
-
-The notebooks in `algo_trader/colab/` are thin launchers. They must export the
-same versioned checkpoint/manifest format used locally. For a small one-symbol
-offline smoke test:
+Run a small synthetic plumbing test (not a performance approval):
 
 ```powershell
-cd .\algo_trader
-python -m pytest -q tests/test_agent.py tests/test_environment.py
-python .\backtest_validation_local.py --symbol AAPL --smoke
+& ..\.venv\Scripts\python.exe -m colab.deepscalper.training train `
+  --synthetic --tiny --epochs 1 --location local --device cpu `
+  --output-dir .\runs\AAPL-smoke --symbol AAPL
 ```
 
-In Colab, mount Drive, set `WEIGHTS_DIR` and `DATA_DIR` to Drive paths, select
-`AAPL`, run notebooks 01→05, and export both the best-validation checkpoint
-and its manifest. To resume, mount the same Drive directory and point notebook
-03 at the saved checkpoint; do not silently switch to local paths. Download
-the `.pth` and manifest into `algo_trader/weights/`, then run
-`python -m workflow offline` before any paper session. Colab GPU availability,
-Drive permissions, Alpaca credentials, and historical-data entitlement require
-an interactive user session and are not CI checks.
-
-Operational readiness (configuration, broker safety, state recovery) is
-separate from model-performance validation (chronological validation/holdout,
-costs, and acceptance gates). A passing offline smoke test does not approve a
-model for trading.
-
-## Tests
+Run/restart the production-shape one-symbol workflow:
 
 ```powershell
-cd algo_trader
-pytest -q
+& ..\.venv\Scripts\python.exe -m colab.deepscalper.training train `
+  --data .\data\AAPL_features.npz --epochs 20 --location local --device cpu `
+  --output-dir .\runs\AAPL --symbol AAPL
+
+& ..\.venv\Scripts\python.exe -m colab.deepscalper.training train `
+  --data .\data\AAPL_features.npz --epochs 20 --location local --device cpu `
+  --output-dir .\runs\AAPL --symbol AAPL --resume
 ```
 
-CI also runs installation/import and tests on Windows.
+Ctrl+C cancels local execution. `latest.pth` and `training_state.json` preserve
+the last completed epoch; `--resume` restores model, optimizer, step, epoch,
+and best-validation state. The replay buffer is deliberately not serialized
+and this fact is recorded in the manifest.
 
-## Important Files
+Evaluate and promote only the selected accepted model:
 
-- algo_trader/config.py
-- algo_trader/main.py
-- algo_trader/execution/strategy.py
-- algo_trader/colab/deepscalper/agent.py
-- algo_trader/colab/deepscalper/architecture.py
-- algo_trader/colab/03_train_deepscalper.ipynb
-- algo_trader/HOW_TRAINING_AND_LIVE_WORK.md
+```powershell
+& ..\.venv\Scripts\python.exe -m colab.deepscalper.training evaluate `
+  --data .\data\AAPL_features.npz `
+  --checkpoint .\runs\AAPL\best.pth `
+  --manifest .\runs\AAPL\best.manifest.json --split holdout --device cpu
+
+& ..\.venv\Scripts\python.exe -m colab.deepscalper.training promote `
+  --checkpoint .\runs\AAPL\best.pth `
+  --manifest .\runs\AAPL\best.manifest.json `
+  --weights-dir .\weights --symbol AAPL
+```
+
+Promotion rejects failed gates, checksum/schema mismatch, non-production
+architecture, or the wrong symbol.
+
+## 6. Google Colab training and resume
+
+The user must open and authorize Colab; this repository does not launch paid
+compute.
+
+1. Open [`algo_trader/colab/01_fetch_training_data.ipynb`](algo_trader/colab/01_fetch_training_data.ipynb)
+   in Colab.
+2. Mount Drive, clone the repository, install `requirements-core.txt`, and add
+   `ALPACA_API_KEY`/`ALPACA_SECRET_KEY` to Colab secrets.
+3. Run notebooks 01 and 02. They call the same `deepscalper.data` package and
+   persist raw data and `AAPL_features.npz` in Drive.
+4. In notebook 03, leave `--location colab` explicit. Set `RESUME=True`; after
+   interruption it reuses Drive-backed `latest.pth`.
+5. Run notebook 05 for greedy holdout evaluation, then notebook 04 to validate
+   and export the accepted best checkpoint plus manifest.
+6. Download `best.pth` and `best.manifest.json` from Drive to a local staging
+   directory and run the same `verify` and `promote` commands shown above.
+
+Colab GPU availability, Drive authorization, data entitlement, and the
+interactive training duration are external checks and are not claimed by CI.
+
+## 7. Model-driven paper session
+
+Model-driven startup requires the promoted `weights/AAPL.pth` and
+`weights/AAPL.manifest.json` pair:
+
+```powershell
+$env:ALGO_TRADER_RUN_MODE = "paper"
+& ..\.venv\Scripts\python.exe .\main.py
+```
+
+The dashboard wires manual position close, emergency cancel/flatten, Local /
+Google Colab guidance, and bounded window-close shutdown through reconciled
+strategy controls. A nonzero exit means the engine failed or Alpaca did not
+confirm flat/terminal state before timeout.
+
+## Verification
+
+```powershell
+& ..\.venv\Scripts\python.exe -m compileall -q .
+& ..\.venv\Scripts\python.exe -m pytest -q
+```
+
+Operational readiness means installation, preflight, no-order enforcement,
+recovery, and broker reconciliation pass. Model-performance validation is
+separate: a promoted model must pass chronological validation and untouched
+holdout gates after realistic costs and terminal liquidation. A plumbing
+smoke test never approves trading performance.

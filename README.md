@@ -38,6 +38,7 @@ deepscalper_copilot/
 
 ```powershell
 cd algo_trader
+$env:ALGO_TRADER_RUN_MODE = "paper"
 python main.py
 ```
 
@@ -74,6 +75,7 @@ Defined in algo_trader/config.py:
 - SOFT_UPDATE_TAU = 0.005
 - STATE_VALUE_TAU = 0.005
 - EXPLORE_RATE = 0.25
+- N_SIZE = 1 (fixed bounded pilot sizing; learned size branch disabled)
 
 ## Documentation
 
