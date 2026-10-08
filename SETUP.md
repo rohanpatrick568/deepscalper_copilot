@@ -41,12 +41,20 @@ Create algo_trader/.env:
 ```env
 ALPACA_API_KEY=YOUR_PAPER_KEY
 ALPACA_SECRET_KEY=YOUR_PAPER_SECRET
+ALPACA_DATA_FEED=iex
+ALPACA_ADJUSTMENT=raw
+ALGO_TRADER_RUN_MODE=preflight
 ```
+
+Copy [algo_trader/.env.example](algo_trader/.env.example) rather than
+inventing variable names. The default universe is one symbol (`AAPL`) and all
+paths resolve from the project, not the current working directory.
 
 Notes:
 
 - main.py validates keys and account connectivity before startup.
-- execution/broker.py enforces PAPER=True.
+- execution/broker.py enforces PAPER=True and the configured feed/adjustment.
+- A missing or incompatible checkpoint fails startup with the symbol and path.
 
 ## Training Pipeline (Colab)
 
@@ -80,17 +88,41 @@ Example for AAPL:
 AAPL.pth
 ```
 
-## Run Live Paper App
+## Safe operational workflow
+
+All commands below are PowerShell commands and do not place orders unless the
+explicit smoke-test mode is selected:
 
 ```powershell
-cd algo_trader
+cd .\algo_trader
+python -m workflow offline       # local artifacts, no network/orders
+python -m workflow preflight     # read-only account/data/calendar inspection
+$env:ALGO_TRADER_RUN_MODE="dry-run"
+python main.py                   # model path, broker boundary rejects orders
+```
+
+For the supervised paper smoke test, use a separate paper account, confirm
+preflight output, and set the bounded mode explicitly:
+
+```powershell
+$env:ALGO_TRADER_RUN_MODE="paper-smoke"
+python main.py
+```
+
+`paper-smoke` is intentionally not a default. Keep the dashboard open and
+stop after the bounded test window; never use live credentials.
+
+Normal model-driven paper mode:
+
+```powershell
+$env:ALGO_TRADER_RUN_MODE="paper"
 python main.py
 ```
 
 Startup behavior:
 
 1. Validate .env credentials and Alpaca paper account
-2. Validate weight file presence for TRADING_UNIVERSE
+2. Validate checkpoint compatibility for the canonical universe
 3. Start Lumibot engine thread
 4. Start PyQt dashboard
 
@@ -101,6 +133,32 @@ $env:ALGO_TRADER_HEADLESS="1"
 python main.py
 ```
 
+## Local or Google Colab training/evaluation
+
+The notebooks in `algo_trader/colab/` are thin launchers. They must export the
+same versioned checkpoint/manifest format used locally. For a small one-symbol
+offline smoke test:
+
+```powershell
+cd .\algo_trader
+python -m pytest -q tests/test_agent.py tests/test_environment.py
+python .\backtest_validation_local.py --symbol AAPL --smoke
+```
+
+In Colab, mount Drive, set `WEIGHTS_DIR` and `DATA_DIR` to Drive paths, select
+`AAPL`, run notebooks 01→05, and export both the best-validation checkpoint
+and its manifest. To resume, mount the same Drive directory and point notebook
+03 at the saved checkpoint; do not silently switch to local paths. Download
+the `.pth` and manifest into `algo_trader/weights/`, then run
+`python -m workflow offline` before any paper session. Colab GPU availability,
+Drive permissions, Alpaca credentials, and historical-data entitlement require
+an interactive user session and are not CI checks.
+
+Operational readiness (configuration, broker safety, state recovery) is
+separate from model-performance validation (chronological validation/holdout,
+costs, and acceptance gates). A passing offline smoke test does not approve a
+model for trading.
+
 ## Tests
 
 ```powershell
@@ -108,7 +166,7 @@ cd algo_trader
 pytest -q
 ```
 
-Current baseline is green with one intentional legacy skip.
+CI also runs installation/import and tests on Windows.
 
 ## Important Files
 

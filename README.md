@@ -33,15 +33,20 @@ deepscalper_copilot/
 1. Create and activate a virtual environment.
 2. Install dependencies from algo_trader/requirements.txt.
 3. Add Alpaca paper keys to algo_trader/.env.
-4. Ensure weights exist for symbols in TRADING_UNIVERSE.
-5. Run:
+4. Ensure the validated `AAPL.pth` checkpoint and manifest exist in `algo_trader/weights/`.
+5. Run the documented workflow:
 
 ```powershell
 cd algo_trader
 python main.py
 ```
 
-For full setup details, see SETUP.md.
+The initial pilot is intentionally AAPL only. `config.py`, runtime, and
+notebooks must use the same `TRADING_UNIVERSE`; do not expand it without
+retraining and exporting compatible checkpoints.
+
+For setup, read-only preflight, no-order dry-run, supervised paper smoke test,
+and training/import details, see [SETUP.md](SETUP.md).
 
 ## Training Pipeline
 
@@ -66,7 +71,7 @@ Defined in algo_trader/config.py:
 - GAMMA = 0.9
 - REPEAT_TIMES = 1.0
 - CLIP_GRAD_NORM = 3.0
-- SOFT_UPDATE_TAU = 0.0
+- SOFT_UPDATE_TAU = 0.005
 - STATE_VALUE_TAU = 0.005
 - EXPLORE_RATE = 0.25
 
@@ -86,5 +91,6 @@ pytest -q
 ## Safety and Scope
 
 - execution/broker.py is configured for paper trading
-- main.py validates credentials and weight presence before startup
+- main.py validates credentials, feed, and checkpoint compatibility before startup
+- `preflight`, `dry-run`, and `offline` modes cannot submit orders
 - This repository is currently intended for paper workflows and validation
