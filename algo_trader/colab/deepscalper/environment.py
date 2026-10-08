@@ -47,7 +47,6 @@ Usage:
 """
 
 import logging
-import random
 from collections import deque
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -95,6 +94,8 @@ class ScalperEnv(gym.Env):
         thirty_day_volume_usd : Optional 30-day notional used for fee-tier selection.
         hindsight_horizon     : h — look-ahead bars for hindsight bonus (10 in V2).
         hindsight_weight      : ω — hindsight bonus coefficient (0.2 in V2).
+        training_mode         : Enables training-only hindsight reward. Evaluation
+                                must set this to False.
     """
 
     metadata = {"render_modes": []}
@@ -112,6 +113,7 @@ class ScalperEnv(gym.Env):
         thirty_day_volume_usd: Optional[float] = None,
         hindsight_horizon:    int   = 10,       # V2 CHANGE: was 60 (TradeMaster: 5 bars)
         hindsight_weight:     float = 0.2,      # V2 CHANGE: was 0.01 (TradeMaster default)
+        training_mode:        bool  = True,
     ) -> None:
         super().__init__()
 
@@ -130,6 +132,7 @@ class ScalperEnv(gym.Env):
         )
         self.hindsight_horizon   = hindsight_horizon
         self.hindsight_weight    = hindsight_weight
+        self.training_mode       = bool(training_mode)
 
         lob_dim   = self.lob_features.shape[1]
         macro_dim = self.macro_features.shape[1]
@@ -194,7 +197,7 @@ class ScalperEnv(gym.Env):
         if requested_day_idx is not None:
             self._day_idx = int(requested_day_idx) % len(self.day_starts)
         elif random_day_reset:
-            self._day_idx = random.randrange(len(self.day_starts))
+            self._day_idx = int(self.np_random.integers(len(self.day_starts)))
         else:
             self._day_idx = self._sequential_day_cursor % len(self.day_starts)
             self._sequential_day_cursor += 1
@@ -260,9 +263,9 @@ class ScalperEnv(gym.Env):
         else:
             base_log_ret = 0.0
 
-        if prev_position == 1:
+        if new_position == 1:
             log_ret = base_log_ret
-        elif prev_position == -1:
+        elif new_position == -1:
             log_ret = -base_log_ret
         else:
             log_ret = 0.0
@@ -271,7 +274,7 @@ class ScalperEnv(gym.Env):
 
         # Update position and entry price
         if trade_occurred:
-            if new_position in (_LONG, _SHORT):
+            if new_position in (-1, 1):
                 self._entry_price = current_price
             else:
                 self._entry_price = 0.0
@@ -281,13 +284,22 @@ class ScalperEnv(gym.Env):
         self._returns_history.append(log_ret)
 
         # V2 CHANGE: Full reward with hindsight bonus + risk penalty
-        reward = self._compute_reward(immediate_reward, current_price, prev_position)
+        reward = self._compute_reward(immediate_reward, current_price, new_position)
+
+        self._t = next_t
+        terminated = self._t >= self._day_end
+        terminal_liquidation = False
+        if terminated and self._position != 0:
+            reward -= abs(self._position) * self.transaction_cost_pct
+            terminal_liquidation = True
+            self._position = 0
+            self._entry_price = 0.0
 
         # Unrealized P&L for private state
         if self._position == 1 and self._entry_price > 0:
-            unreal_pnl = (current_price - self._entry_price) / self._entry_price
+            unreal_pnl = (next_price - self._entry_price) / self._entry_price
         elif self._position == -1 and self._entry_price > 0:
-            unreal_pnl = (self._entry_price - current_price) / self._entry_price
+            unreal_pnl = (self._entry_price - next_price) / self._entry_price
         else:
             unreal_pnl = 0.0
 
@@ -297,10 +309,6 @@ class ScalperEnv(gym.Env):
                      dtype=np.float32)
         )
 
-        # Advance time
-        self._t = next_t
-        terminated = self._t >= self._day_end
-
         # Volatility target for auxiliary task (std of z_close over lookback)
         win_start  = max(0, self._t - self.lookback_bars)
         z_close_win = self.macro_features[win_start:self._t, 3]
@@ -309,8 +317,13 @@ class ScalperEnv(gym.Env):
         info = {
             'vol_target':    vol_target,
             'current_price': current_price,
+            'next_price':    next_price,
             'position':      self._position,
+            'entry_price':   self._entry_price,
             'log_return':    log_ret,
+            'transaction_cost': transaction_cost
+                                + (self.transaction_cost_pct if terminal_liquidation else 0.0),
+            'terminal_liquidation': terminal_liquidation,
         }
 
         obs = self._get_obs()
@@ -340,7 +353,7 @@ class ScalperEnv(gym.Env):
         Args:
             immediate:     Already-computed log_return minus transaction cost.
             current_price: Price at the current bar.
-            prev_position: Position held before this step (0=flat, 1=long).
+            prev_position: Position selected for the return interval.
 
         Returns:
             Scalar total reward.
@@ -349,7 +362,7 @@ class ScalperEnv(gym.Env):
         total = immediate
 
         # Component 2: Hindsight bonus (training oracle)
-        if prev_position == 1:
+        if self.training_mode and prev_position == 1:
             future_end = min(self._t + self.hindsight_horizon, self._day_end)
             if future_end > self._t:
                 future_prices = self.close_prices[self._t:future_end]
@@ -357,7 +370,7 @@ class ScalperEnv(gym.Env):
                     np.log(future_prices / (current_price + 1e-10) + 1e-10)
                 ))
                 total += self.hindsight_weight * max(best_future, 0.0)
-        elif prev_position == -1:
+        elif self.training_mode and prev_position == -1:
             future_end = min(self._t + self.hindsight_horizon, self._day_end)
             if future_end > self._t:
                 future_prices = self.close_prices[self._t:future_end]

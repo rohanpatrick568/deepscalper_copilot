@@ -43,7 +43,10 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 
-from colab.deepscalper.architecture import DeepScalperNet
+try:
+    from .architecture import DeepScalperNet
+except ImportError:  # pragma: no cover - direct notebook compatibility
+    from colab.deepscalper.architecture import DeepScalperNet
 
 logger = logging.getLogger(__name__)
 
@@ -456,6 +459,7 @@ class DeepScalperAgent:
     def select_action(
         self,
         obs: Dict[str, np.ndarray],
+        explore: bool = True,
     ) -> Tuple[int, int]:
         """TradeMaster-style static ε-greedy action selection.
 
@@ -468,7 +472,7 @@ class DeepScalperAgent:
         self._steps += 1
         self.epsilon = self.explore_rate
 
-        if random.random() < self.explore_rate:
+        if explore and random.random() < self.explore_rate:
             return random.randrange(self.n_dir), random.randrange(self.n_size)
 
         self.online_net.eval()
@@ -477,7 +481,8 @@ class DeepScalperAgent:
             priv  = torch.tensor(obs['priv'][None],  dtype=torch.float32, device=self.device)
             macro = torch.tensor(obs['macro'][None],  dtype=torch.float32, device=self.device)
             q_dir, q_size = self.online_net(lob, priv, macro)
-        self.online_net.train()
+        if explore:
+            self.online_net.train()
         return int(q_dir.argmax(1).item()), int(q_size.argmax(1).item())
 
     # ------------------------------------------------------------------

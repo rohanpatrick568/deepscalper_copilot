@@ -34,6 +34,7 @@ from dashboard.data_bridge import DataBridge
 from dashboard.equity_bar import EquityBar
 from dashboard.positions_table import PositionsTable
 from dashboard.trade_log import TradeLog
+from dashboard.training_choice import TrainingChoice
 
 logger = logging.getLogger(__name__)
 
@@ -125,6 +126,9 @@ class MainWindow(QMainWindow):
         # ---- Top equity bar (full width) ----
         self._equity_bar = EquityBar(data_bridge=self._bridge, parent=self)
         root_layout.addWidget(self._equity_bar)
+
+        self._training_choice = TrainingChoice(parent=self)
+        root_layout.addWidget(self._training_choice)
 
         # ---- Three-panel horizontal splitter ----
         splitter = QSplitter(Qt.Horizontal, self)

@@ -200,6 +200,31 @@ class TestStep:
         env.step(2)   # LONG
         assert env._position == 1
 
+    def test_action_return_and_private_history_are_time_aligned(self):
+        env = _make_env(n_bars=60, n_days=1)
+        env.reset(seed=0)
+        current = env.close_prices[env._t]
+        following = env.close_prices[env._t + 1]
+        obs, reward, _, _, info = env.step(2)
+        expected = np.log(following / current) - env.transaction_cost_pct
+        assert info["log_return"] == pytest.approx(np.log(following / current))
+        assert reward >= expected - 1e-6
+        assert info["entry_price"] == pytest.approx(current)
+        assert obs["priv"][-1, 0] == pytest.approx(1.0)
+        assert obs["priv"][-1, 1] == pytest.approx((following - current) / current)
+
+    def test_terminal_position_is_liquidated_with_cost(self):
+        env = _make_env(n_bars=30, lookback=10, n_days=1)
+        env.reset(seed=0)
+        info = {}
+        terminated = False
+        while not terminated:
+            _, _, terminated, _, info = env.step(2)
+        assert info["terminal_liquidation"] is True
+        assert info["position"] == 0
+        assert info["entry_price"] == 0.0
+        assert info["transaction_cost"] >= env.transaction_cost_pct
+
     def test_action_1_from_long_exits(self):
         env = _make_env()
         env.reset(seed=0)
