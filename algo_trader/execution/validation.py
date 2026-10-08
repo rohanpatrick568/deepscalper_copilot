@@ -13,10 +13,15 @@ import torch
 from config import (
     DATA_DELAY_MAX_SECONDS,
     DATA_FEED,
+    FC_HIDDEN,
+    GRU_HIDDEN,
     LOB_DIM,
+    LOOKBACK_BARS,
     MACRO_DIM,
+    MACRO_EMBED_DIM,
     N_DIR,
     N_SIZE,
+    PRIV_DIM,
     TRADING_UNIVERSE,
     WEIGHTS_DIR,
 )
@@ -63,7 +68,12 @@ def checkpoint_path(symbol: str, weights_dir: Path = WEIGHTS_DIR) -> Path:
     return Path(weights_dir) / checkpoint_filename(symbol)
 
 
-def validate_checkpoint(path: Path, *, symbol: str | None = None) -> dict:
+def validate_checkpoint(
+    path: Path,
+    *,
+    symbol: str | None = None,
+    require_approved: bool = False,
+) -> dict:
     """Load and validate architecture metadata before a model can run."""
     if not path.is_file():
         raise FileNotFoundError(f"Missing checkpoint: {path}")
@@ -82,6 +92,29 @@ def validate_checkpoint(path: Path, *, symbol: str | None = None) -> dict:
     manifest = checkpoint.get("manifest")
     if symbol and manifest and manifest.get("symbol") not in (None, symbol):
         raise ValueError(f"Checkpoint {path} manifest symbol does not match {symbol}")
+    if require_approved:
+        from colab.deepscalper.training import validate_artifact
+
+        artifact_manifest = validate_artifact(
+            path, path.with_name(f"{path.stem}.manifest.json")
+        )
+        if not artifact_manifest["accepted"]:
+            raise ValueError(f"Checkpoint {path} did not pass acceptance gates")
+        if symbol and artifact_manifest["symbol"] != symbol:
+            raise ValueError(f"Checkpoint {path} manifest symbol does not match {symbol}")
+        expected_model = {
+            "macro_dim": MACRO_DIM,
+            "lob_dim": LOB_DIM,
+            "priv_dim": PRIV_DIM,
+            "n_dir": N_DIR,
+            "n_size": N_SIZE,
+            "gru_hidden": GRU_HIDDEN,
+            "macro_embed": MACRO_EMBED_DIM,
+            "fc_hidden": FC_HIDDEN,
+            "lookback_bars": LOOKBACK_BARS,
+        }
+        if artifact_manifest["model"] != expected_model:
+            raise ValueError(f"Checkpoint {path} is not runtime-compatible")
     return checkpoint
 
 
@@ -97,7 +130,11 @@ def validate_startup_configuration(
     if N_DIR != 3 or N_SIZE < 1:
         raise ValueError(f"Unsupported model action shape: n_dir={N_DIR}, n_size={N_SIZE}")
     for symbol in symbols:
-        validate_checkpoint(checkpoint_path(symbol, weights_dir), symbol=symbol)
+        validate_checkpoint(
+            checkpoint_path(symbol, weights_dir),
+            symbol=symbol,
+            require_approved=True,
+        )
 
 
 def file_sha256(path: Path) -> str:

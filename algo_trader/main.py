@@ -46,25 +46,36 @@ def _validate_environment() -> None:
     Raises:
         SystemExit: On any validation failure.
     """
-    from config import ALPACA_API_KEY, ALPACA_SECRET_KEY, RUN_MODE, TRADING_UNIVERSE, WEIGHTS_DIR
+    from config import (
+        ALPACA_API_KEY,
+        ALPACA_SECRET_KEY,
+        PAPER_ORDER_MODES,
+        RUN_MODE,
+        RUN_MODES,
+        TRADING_UNIVERSE,
+        WEIGHTS_DIR,
+    )
     from execution.validation import validate_startup_configuration
 
+    if RUN_MODE not in RUN_MODES:
+        raise RuntimeError(f"Unsupported ALGO_TRADER_RUN_MODE: {RUN_MODE}")
+    if RUN_MODE != "paper":
+        raise RuntimeError(
+            f"main.py runs model-driven paper mode only; use "
+            f"'python -m workflow {RUN_MODE}' for {RUN_MODE!r}"
+        )
+    if RUN_MODE not in PAPER_ORDER_MODES:
+        raise RuntimeError("Broker mutations were not explicitly enabled")
     try:
         validate_startup_configuration(TRADING_UNIVERSE, WEIGHTS_DIR)
     except (FileNotFoundError, ValueError) as exc:
-        logger.critical("Configuration/checkpoint validation failed: %s", exc)
-        sys.exit(1)
-
-    if RUN_MODE in {"offline", "dry-run"}:
-        logger.info("No-order mode %s: broker order submission is disabled.", RUN_MODE)
-        return
+        raise RuntimeError(f"Configuration/checkpoint validation failed: {exc}") from exc
 
     # 1. Credentials check
     if not ALPACA_API_KEY or not ALPACA_SECRET_KEY:
-        logger.critical(
-            "ALPACA_API_KEY and ALPACA_SECRET_KEY must be set in .env — aborting."
+        raise RuntimeError(
+            "ALPACA_API_KEY and ALPACA_SECRET_KEY must be set in .env"
         )
-        sys.exit(1)
 
     # 2. Live API reachability check
     try:
@@ -78,13 +89,59 @@ def _validate_environment() -> None:
             account.buying_power,
         )
     except Exception as exc:
-        logger.critical("Alpaca credential verification failed: %s — aborting.", exc)
-        sys.exit(1)
+        raise RuntimeError(f"Alpaca paper verification failed: {exc}") from exc
 
     logger.info("All %d symbol checkpoint(s) verified.", len(TRADING_UNIVERSE))
 
 
-def _run_lumibot(bridge) -> None:
+class EngineController:
+    """Thread-safe dashboard facade for reconciled strategy controls."""
+
+    def __init__(self, bridge) -> None:
+        self.bridge = bridge
+        self.strategy = None
+        self.failure: Exception | None = None
+        self.shutdown_confirmed: bool | None = None
+        self._lock = threading.RLock()
+
+    def attach(self, strategy) -> None:
+        with self._lock:
+            self.strategy = strategy
+
+    def fail(self, exc: Exception) -> None:
+        with self._lock:
+            self.failure = exc
+            self.bridge.engine_error = f"{type(exc).__name__}: {exc}"
+
+    def close_position(self, symbol: str) -> bool:
+        with self._lock:
+            if self.strategy is None:
+                self.bridge.engine_error = "Execution engine is not ready"
+                return False
+            return self.strategy.request_close_position(symbol)
+
+    def emergency(self, timeout_seconds: float = 30.0) -> bool:
+        with self._lock:
+            if self.strategy is None:
+                self.bridge.engine_error = "Execution engine is not ready"
+                return False
+            confirmed = self.strategy.graceful_shutdown(timeout_seconds)
+            self.strategy.stop_live_engine()
+            self.shutdown_confirmed = confirmed
+            return confirmed
+
+    def shutdown(self, timeout_seconds: float = 30.0) -> bool:
+        with self._lock:
+            if self.strategy is None:
+                self.shutdown_confirmed = False
+                return False
+            confirmed = self.strategy.graceful_shutdown(timeout_seconds)
+            self.strategy.stop_live_engine()
+            self.shutdown_confirmed = confirmed
+            return confirmed
+
+
+def _run_lumibot(bridge, controller: EngineController) -> None:
     """Target function for the Lumibot daemon thread.
 
     Args:
@@ -102,13 +159,15 @@ def _run_lumibot(bridge) -> None:
             alpaca_api_key=ALPACA_API_KEY,
             alpaca_secret_key=ALPACA_SECRET_KEY,
         )
+        controller.attach(strategy)
         logger.info("Starting Lumibot trading engine…")
         strategy.run_live()
-    except Exception:
+    except Exception as exc:
+        controller.fail(exc)
         logger.exception("Lumibot thread encountered an unhandled exception:")
 
 
-def _run_dashboard(bridge) -> None:
+def _run_dashboard(bridge, controller: EngineController) -> int:
     """Start the PyQt5 dashboard in the main thread.
 
     Args:
@@ -118,7 +177,12 @@ def _run_dashboard(bridge) -> None:
     from dashboard.main_window import MainWindow
 
     app = QApplication(sys.argv)
-    window = MainWindow(data_bridge=bridge)
+    window = MainWindow(
+        data_bridge=bridge,
+        close_position_callback=controller.close_position,
+        emergency_callback=controller.emergency,
+        shutdown_callback=controller.shutdown,
+    )
     window.show()
     logger.info("Dashboard window opened.")
     exit_code = app.exec_()
@@ -126,12 +190,16 @@ def _run_dashboard(bridge) -> None:
     return exit_code
 
 
-def main() -> None:
+def main() -> int:
     """Main entry point — validates, starts threads, runs Qt event loop."""
     logger.info("AlgoTrader starting up…")
 
     # Validate before doing anything else
-    _validate_environment()
+    try:
+        _validate_environment()
+    except RuntimeError as exc:
+        logger.critical("%s", exc)
+        return 1
 
     # Instantiate the shared DataBridge (single source of truth for UI)
     from dashboard.data_bridge import DataBridge
@@ -146,11 +214,12 @@ def main() -> None:
     import torch  # noqa: F401
 
     # Start Lumibot in a daemon background thread
+    controller = EngineController(bridge)
     lumibot_thread = threading.Thread(
         target=_run_lumibot,
-        args=(bridge,),
+        args=(bridge, controller),
         name="LumibotEngine",
-        daemon=True,   # Dies automatically when main thread exits
+        daemon=True,
     )
     lumibot_thread.start()
     logger.info("Lumibot engine thread started (daemon=True).")
@@ -171,14 +240,24 @@ def main() -> None:
                 time.sleep(1)
             exit_code = 0
         else:
-            exit_code = _run_dashboard(bridge)
+            exit_code = _run_dashboard(bridge, controller)
     except KeyboardInterrupt:
         logger.info("KeyboardInterrupt received — shutting down.")
-        exit_code = 0
+        exit_code = 0 if controller.shutdown() else 2
 
-    logger.info("AlgoTrader shutdown complete.")
-    sys.exit(exit_code)
+    if controller.shutdown_confirmed is None:
+        if not controller.shutdown():
+            exit_code = max(exit_code, 2)
+    lumibot_thread.join(timeout=10)
+    if lumibot_thread.is_alive():
+        logger.error("Lumibot engine did not stop within the bounded join timeout")
+        exit_code = max(exit_code, 3)
+    if controller.failure is not None:
+        exit_code = max(exit_code, 1)
+
+    logger.info("AlgoTrader shutdown complete (exit code %d).", exit_code)
+    return exit_code
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

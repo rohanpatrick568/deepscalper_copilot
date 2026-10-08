@@ -187,6 +187,11 @@ class CircuitBreaker:
         self._daily_pnl = 0.0
         self._halted_by_loss = False
 
+    def restore_latched_loss(self, absolute_pnl: float) -> None:
+        """Restore a persisted loss latch without allowing a restart reset."""
+        self._daily_pnl = float(absolute_pnl)
+        self._halted_by_loss = True
+
     @property
     def daily_pnl(self) -> float:
         """Current running daily P&L in USD (read-only)."""

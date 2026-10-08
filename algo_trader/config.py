@@ -108,11 +108,23 @@ MARKET_TIMEZONE: str = "US/Eastern"
 # Model Architecture  (DeepScalper paper — CIKM '22, Sun et al.)
 # ---------------------------------------------------------------------------
 PROJECT_ROOT: Path = Path(__file__).resolve().parent
-WEIGHTS_DIR: Path = Path(os.getenv("WEIGHTS_DIR", str(PROJECT_ROOT / "weights"))).expanduser().resolve()
-DATA_DIR: Path = Path(os.getenv("DATA_DIR", str(PROJECT_ROOT / "data"))).expanduser().resolve()
+
+
+def _configured_path(name: str, default: Path) -> Path:
+    value = os.getenv(name, "").strip()
+    return Path(value or default).expanduser().resolve()
+
+
+WEIGHTS_DIR: Path = _configured_path("WEIGHTS_DIR", PROJECT_ROOT / "weights")
+DATA_DIR: Path = _configured_path("DATA_DIR", PROJECT_ROOT / "data")
 RUN_MODE: str = os.getenv("ALGO_TRADER_RUN_MODE", "preflight").strip().lower()
 NO_ORDER_MODES = {"preflight", "dry-run", "offline"}
+PAPER_ORDER_MODES = {"paper", "paper-smoke"}
+RUN_MODES = NO_ORDER_MODES | PAPER_ORDER_MODES
 PAPER_ONLY: bool = True
+EXECUTION_STATE_PATH: Path = _configured_path(
+    "EXECUTION_STATE_PATH", PROJECT_ROOT / "runtime" / "execution-state.json"
+)
 
 # --- Observation dimensions ---
 MACRO_DIM: int = 11    # Macro features: z_open/high/low/close/adj + z_d_5..30 (Table 2)
@@ -125,7 +137,7 @@ INPUT_DIM: int = MACRO_DIM  # = 11
 # --- Action space (Branching Dueling Q-Network) ---
 # Paper-aligned direction/size branches
 N_DIR: int = 3         # Direction branch: 0=SHORT, 1=FLAT, 2=LONG
-N_SIZE: int = 4        # Size branch cardinality
+N_SIZE: int = 1        # Fixed bounded pilot sizing; no unused learned size branch
 ACTION_DIM: int = 3    # Discrete action semantics: SHORT/FLAT/LONG
 
 # --- Encoder dimensions ---

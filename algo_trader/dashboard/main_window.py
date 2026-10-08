@@ -22,7 +22,10 @@ import logging
 from PyQt5.QtCore import Qt, QTimer
 from PyQt5.QtGui import QFont
 from PyQt5.QtWidgets import (
+    QHBoxLayout,
     QMainWindow,
+    QMessageBox,
+    QPushButton,
     QSplitter,
     QVBoxLayout,
     QWidget,
@@ -85,11 +88,16 @@ class MainWindow(QMainWindow):
         self,
         data_bridge: DataBridge,
         close_position_callback=None,
+        emergency_callback=None,
+        shutdown_callback=None,
         parent=None,
     ) -> None:
         super().__init__(parent)
         self._bridge = data_bridge
         self._close_callback = close_position_callback
+        self._emergency_callback = emergency_callback
+        self._shutdown_callback = shutdown_callback
+        self._shown_engine_error = ""
 
         self._configure_window()
         self._build_ui()
@@ -129,6 +137,15 @@ class MainWindow(QMainWindow):
 
         self._training_choice = TrainingChoice(parent=self)
         root_layout.addWidget(self._training_choice)
+
+        controls = QWidget(self)
+        controls_layout = QHBoxLayout(controls)
+        controls_layout.setContentsMargins(12, 4, 12, 4)
+        controls_layout.addStretch(1)
+        emergency = QPushButton("Emergency Cancel + Flatten", controls)
+        emergency.clicked.connect(self._request_emergency_flatten)
+        controls_layout.addWidget(emergency)
+        root_layout.addWidget(controls)
 
         # ---- Three-panel horizontal splitter ----
         splitter = QSplitter(Qt.Horizontal, self)
@@ -190,6 +207,9 @@ class MainWindow(QMainWindow):
             self._positions_table.refresh()
             self._confidence_panel.refresh()
             self._trade_log.refresh()
+            if self._bridge.engine_error and self._bridge.engine_error != self._shown_engine_error:
+                self._shown_engine_error = self._bridge.engine_error
+                QMessageBox.critical(self, "Execution engine failed", self._shown_engine_error)
         except Exception as exc:
             # Log but never crash the GUI loop
             logger.error("Dashboard refresh error: %s", exc, exc_info=True)
@@ -205,5 +225,30 @@ class MainWindow(QMainWindow):
             event: QCloseEvent.
         """
         self._timer.stop()
-        logger.info("Dashboard window closed — timer stopped.")
+        confirmed = self._shutdown_callback() if self._shutdown_callback else True
+        if not confirmed:
+            QMessageBox.critical(
+                self,
+                "Shutdown not confirmed",
+                "The broker did not confirm flat positions and terminal orders "
+                "before the shutdown timeout. Check Alpaca immediately.",
+            )
+        logger.info("Dashboard window closed — timer stopped; flat=%s.", confirmed)
         super().closeEvent(event)
+
+    def _request_emergency_flatten(self) -> None:
+        if not self._emergency_callback:
+            QMessageBox.warning(self, "Unavailable", "The execution engine is not ready.")
+            return
+        confirmed = self._emergency_callback()
+        if confirmed:
+            QMessageBox.information(
+                self, "Confirmed", "Broker confirmed positions flat and orders terminal."
+            )
+        else:
+            QMessageBox.warning(
+                self,
+                "Pending",
+                "Emergency cancellation/flattening was requested but is not yet "
+                "broker-confirmed. Monitor the account.",
+            )

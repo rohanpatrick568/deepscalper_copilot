@@ -127,6 +127,7 @@ class DataBridge:
         # Status flags
         self._is_halted: bool = False
         self._halt_reason: str = ""
+        self._engine_error: str = ""
 
     # ------------------------------------------------------------------
     # Position management
@@ -236,6 +237,16 @@ class DataBridge:
         """Maximum drawdown fraction since strategy start (negative value)."""
         with self._lock:
             return self._max_drawdown
+
+    @property
+    def engine_error(self) -> str:
+        with self._lock:
+            return self._engine_error
+
+    @engine_error.setter
+    def engine_error(self, value: str) -> None:
+        with self._lock:
+            self._engine_error = str(value)
 
     @property
     def is_halted(self) -> bool:
