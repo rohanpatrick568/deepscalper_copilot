@@ -6,6 +6,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import pandas as pd
+from alpaca.common.enums import Sort
 from alpaca.data.enums import Adjustment, DataFeed
 from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.requests import StockBarsRequest
@@ -63,6 +64,7 @@ class AlpacaBarSource:
             start=completed_before - timedelta(days=10),
             end=completed_before,
             limit=limit,
+            sort=Sort.DESC,
             feed=self.feed,
             adjustment=self.adjustment,
         )
@@ -74,6 +76,9 @@ class AlpacaBarSource:
             except (KeyError, ValueError):
                 frame = frame.droplevel(0)
         frame.index = pd.DatetimeIndex(frame.index)
+        if frame.index.tz is None:
+            frame.index = frame.index.tz_localize("UTC")
+        else:
+            frame.index = frame.index.tz_convert("UTC")
         frame = frame.loc[frame.index < pd.Timestamp(completed_before)]
-        return frame.tail(limit)
-
+        return frame.sort_index().tail(limit)

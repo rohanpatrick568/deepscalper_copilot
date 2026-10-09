@@ -500,4 +500,5 @@ def test_market_data_request_carries_feed_adjustment_and_excludes_open_bar():
     )
     assert captured["feed"].value == "iex"
     assert captured["adjustment"].value == "raw"
+    assert captured["sort"].value == "desc"
     assert list(bars.index) == [pd.Timestamp("2026-01-05T14:29:00Z")]

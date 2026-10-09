@@ -62,30 +62,61 @@ def run_paper_round_trip(
             f"{len(existing_positions)} position(s), {len(existing_orders)} open order(s)"
         )
 
+    clock = getattr(client, "get_clock", None)
+    if not callable(clock):
+        raise RuntimeError("Paper smoke requires a broker clock")
+    if not bool(getattr(clock(), "is_open", False)):
+        raise RuntimeError("Paper smoke requires an open, tradable session")
+
     prefix = f"ds-smoke-{symbol.lower()}-{uuid.uuid4().hex[:12]}"
     own_orders: list[Any] = []
-    deadline = time.monotonic() + timeout_seconds
+
+    def lookup(order: Any) -> Any:
+        client_id = getattr(order, "client_order_id", None)
+        if client_id and hasattr(client, "get_order_by_client_id"):
+            return client.get_order_by_client_id(client_id)
+        return client.get_order_by_id(order.id)
 
     def wait_terminal(order: Any) -> Any:
         current = order
+        deadline = time.monotonic() + timeout_seconds
         while time.monotonic() < deadline:
-            current = client.get_order_by_id(current.id)
+            current = lookup(current)
             if _status(current) in TERMINAL:
                 return current
             sleep_fn(0.5)
         client.cancel_order_by_id(current.id)
-        raise TimeoutError(f"Paper smoke order {current.id} did not become terminal")
+        cancel_deadline = time.monotonic() + timeout_seconds
+        while time.monotonic() < cancel_deadline:
+            current = lookup(current)
+            if _status(current) in TERMINAL:
+                return current
+            sleep_fn(0.5)
+        raise TimeoutError(f"Paper smoke order {current.id} did not become terminal after cancellation")
+
+    def submit(request: Any, client_id: str) -> Any:
+        try:
+            order = client.submit_order(request)
+        except Exception:
+            if not hasattr(client, "get_order_by_client_id"):
+                raise
+            order = client.get_order_by_client_id(client_id)
+        if not getattr(order, "client_order_id", None):
+            order.client_order_id = client_id
+        return order
 
     failure: Exception | None = None
     try:
-        buy = client.submit_order(
+        buy_id = f"{prefix}-buy"
+        buy = submit(
             MarketOrderRequest(
                 symbol=symbol,
                 notional=notional,
                 side=OrderSide.BUY,
                 time_in_force=TimeInForce.DAY,
-                client_order_id=f"{prefix}-buy",
-            )
+                client_order_id=buy_id,
+            ),
+            buy_id,
         )
         own_orders.append(buy)
         buy = wait_terminal(buy)
@@ -105,14 +136,16 @@ def run_paper_round_trip(
         test_qty = Decimal(str(positions[0].qty))
         if len(own_orders) >= max_orders:
             raise RuntimeError("Smoke exhausted its bounded order count before flattening") from failure
-        sell = client.submit_order(
+        sell_id = f"{prefix}-sell"
+        sell = submit(
             MarketOrderRequest(
                 symbol=symbol,
                 qty=test_qty,
                 side=OrderSide.SELL,
                 time_in_force=TimeInForce.DAY,
-                client_order_id=f"{prefix}-sell",
-            )
+                client_order_id=sell_id,
+            ),
+            sell_id,
         )
         own_orders.append(sell)
         sell = wait_terminal(sell)
@@ -126,7 +159,7 @@ def run_paper_round_trip(
         for position in client.get_all_positions()
         if _symbol(position) == symbol and Decimal(str(position.qty)) != 0
     ]
-    terminal_orders = [client.get_order_by_id(order.id) for order in own_orders]
+    terminal_orders = [lookup(order) for order in own_orders]
     if remaining or any(_status(order) not in TERMINAL for order in terminal_orders):
         raise RuntimeError("Broker did not confirm smoke position flat and orders terminal")
     return {

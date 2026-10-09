@@ -14,6 +14,8 @@ Operational policy:
 
 import logging
 import sys
+import threading
+import time
 from collections import defaultdict, deque
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -148,6 +150,7 @@ class EquityDeepScalper(Strategy):
         self._shutdown_requested = False
         self._calendar_cache: Dict[date, datetime] = {}
         self._bar_source: Optional[AlpacaBarSource] = None
+        self._exit_locks: Dict[str, threading.RLock] = defaultdict(threading.RLock)
 
         self._tz = pytz.timezone(MARKET_TIMEZONE)
 
@@ -626,56 +629,60 @@ class EquityDeepScalper(Strategy):
             logger.error("Failed to submit %s for %s: %s", side.upper(), symbol, exc)
 
     def _submit_exit_flat(self, symbol: str, asset: Asset, current_price: float, reason: str) -> None:
-        if self._exit_iteration.get(symbol) == self._iteration_index:
-            logger.info("Skipping duplicate exit for %s in iteration %d", symbol, self._iteration_index)
-            return
-        if self._has_pending_exit(symbol):
-            logger.info("Exit already pending for %s", symbol)
-            return
-        try:
-            position = self.get_position(asset)
-            if not position:
+        if not hasattr(self, "_exit_locks"):
+            self._exit_locks = defaultdict(threading.RLock)
+        with self._exit_locks[symbol]:
+            if self._exit_iteration.get(symbol) == self._iteration_index:
+                logger.info("Skipping duplicate exit for %s in iteration %d", symbol, self._iteration_index)
                 return
-            qty = float(position.quantity)
-            if qty == 0:
+            if self._has_pending_exit(symbol):
+                logger.info("Exit already pending for %s", symbol)
                 return
-            side = "sell" if qty > 0 else "buy"
-            if RUN_MODE not in NO_ORDER_MODES:
-                self._cancel_active_orders_for_symbol(symbol)
-            order = self.create_order(asset, abs(qty), side)
-            client_id = self._state_store.next_client_order_id(symbol, "exit")
-            order.custom_params = {"client_order_id": client_id}
-            if RUN_MODE in {"offline", "dry-run", "preflight"}:
-                logger.info("NO ORDER (%s): EXIT %.2f %s", RUN_MODE, abs(qty), symbol)
-                return
-            state = {
-                "symbol": symbol,
-                "intent": "exit",
-                "side": side,
-                "qty": abs(qty),
-                "filled_qty": 0.0,
-                "remaining_qty": abs(qty),
-                "estimated_price": current_price,
-                "status": "submitting",
-                "reason": reason,
-            }
-            self._order_state[client_id] = state
-            self._state_store.set_order(client_id, state)
-            submitted = self.submit_order(order)
-            status = str(getattr(submitted, "status", "submitted")).lower()
-            if getattr(submitted, "error_message", None):
-                status = "rejected"
-            state["status"] = status
-            state["broker_order_id"] = str(getattr(submitted, "identifier", ""))
-            self._state_store.set_order(client_id, state)
-            if status in {"error", "rejected"}:
-                logger.error("Exit rejected for %s; protection remains active", symbol)
-                return
-            self._exit_iteration[symbol] = self._iteration_index
-            self._last_exit_iteration[symbol] = self._iteration_index
-            logger.info("EXIT %s %.2f %s @ ~$%.2f (%s)", side.upper(), abs(qty), symbol, current_price, reason)
-        except Exception as exc:
-            logger.error("Failed to submit EXIT for %s: %s", symbol, exc)
+            try:
+                if RUN_MODE not in NO_ORDER_MODES:
+                    self._wait_for_symbol_orders(symbol)
+                # Re-read only after cancellations and late fills are reconciled.
+                position = self.get_position(asset)
+                if not position:
+                    return
+                qty = float(position.quantity)
+                if qty == 0:
+                    return
+                side = "sell" if qty > 0 else "buy"
+                order = self.create_order(asset, abs(qty), side)
+                client_id = self._state_store.next_client_order_id(symbol, "exit")
+                order.custom_params = {"client_order_id": client_id}
+                if RUN_MODE in {"offline", "dry-run", "preflight"}:
+                    logger.info("NO ORDER (%s): EXIT %.2f %s", RUN_MODE, abs(qty), symbol)
+                    return
+                state = {
+                    "symbol": symbol,
+                    "intent": "exit",
+                    "side": side,
+                    "qty": abs(qty),
+                    "filled_qty": 0.0,
+                    "remaining_qty": abs(qty),
+                    "estimated_price": current_price,
+                    "status": "submitting",
+                    "reason": reason,
+                }
+                self._order_state[client_id] = state
+                self._state_store.set_order(client_id, state)
+                submitted = self.submit_order(order)
+                status = str(getattr(submitted, "status", "submitted")).lower()
+                if getattr(submitted, "error_message", None):
+                    status = "rejected"
+                state["status"] = status
+                state["broker_order_id"] = str(getattr(submitted, "identifier", ""))
+                self._state_store.set_order(client_id, state)
+                if status in {"error", "rejected"}:
+                    logger.error("Exit rejected for %s; protection remains active", symbol)
+                    return
+                self._exit_iteration[symbol] = self._iteration_index
+                self._last_exit_iteration[symbol] = self._iteration_index
+                logger.info("EXIT %s %.2f %s @ ~$%.2f (%s)", side.upper(), abs(qty), symbol, current_price, reason)
+            except Exception as exc:
+                logger.error("Failed to submit EXIT for %s: %s", symbol, exc)
 
     def _risk_exit_check(self, symbol: str, asset: Asset, bars: pd.DataFrame, current_price: float, side: str) -> bool:
         active_stop = self._stop_prices.get(symbol, 0.0)
@@ -959,6 +966,30 @@ class EquityDeepScalper(Strategy):
             if str(getattr(order, "status", "")).lower() in terminal:
                 continue
             self.cancel_order(order)
+
+    def _wait_for_symbol_orders(self, symbol: str, timeout: float = 5.0) -> None:
+        """Cancel and reconcile before calculating the close quantity."""
+        terminal = {"filled", "fill", "canceled", "cancelled", "rejected", "expired"}
+        self._cancel_active_orders_for_symbol(symbol)
+        deadline = time.monotonic() + max(0.0, timeout)
+        while time.monotonic() < deadline:
+            active = [
+                order for order in self.get_orders()
+                if str(order.asset.symbol) == symbol
+                and str(getattr(order, "status", "")).lower() not in terminal
+            ]
+            if not active:
+                return
+            self._reconcile_broker_state()
+            self.sleep(0.05)
+        self._reconcile_broker_state()
+        active = [
+            order for order in self.get_orders()
+            if str(order.asset.symbol) == symbol
+            and str(getattr(order, "status", "")).lower() not in terminal
+        ]
+        if active:
+            raise TimeoutError(f"Timed out cancelling active orders for {symbol}")
 
     def request_close_position(self, symbol: str, reason: str = "MANUAL_CLOSE") -> bool:
         if symbol not in TRADING_UNIVERSE:

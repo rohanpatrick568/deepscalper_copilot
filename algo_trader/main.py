@@ -4,7 +4,7 @@ main.py — AlgoTrader System Entry Point.
 Starts the complete DeepScalper × Alpaca paper trading system:
   1. Validates environment (.env) and credentials.
         2. Verifies all configured equity weight files exist in ./weights/.
-  3. Starts Lumibot trading engine in a background daemon thread.
+  3. Starts Lumibot's asynchronous pool from the main thread.
   4. Starts PyQt5 dashboard in the main thread (required by Qt).
 
 Usage:
@@ -103,6 +103,7 @@ class EngineController:
         self.failure: Exception | None = None
         self.shutdown_confirmed: bool | None = None
         self._lock = threading.RLock()
+        self.trader = None
 
     def attach(self, strategy) -> None:
         with self._lock:
@@ -141,30 +142,38 @@ class EngineController:
             return confirmed
 
 
-def _run_lumibot(bridge, controller: EngineController) -> None:
-    """Target function for the Lumibot daemon thread.
+def _start_lumibot(bridge, controller: EngineController) -> None:
+    """Start Lumibot from the process main thread.
 
-    Args:
-        bridge: Shared DataBridge instance passed to the strategy.
+    ``Trader.run_all`` installs SIGINT handlers, so it must not be called from
+    a worker.  Its asynchronous pool keeps the Qt event loop responsive while
+    retaining Lumibot's real strategy executor and shutdown lifecycle.
     """
-    try:
-        from config import ALPACA_API_KEY, ALPACA_SECRET_KEY
-        from execution.broker import get_broker
-        from execution.strategy import EquityDeepScalper
+    from config import ALPACA_API_KEY, ALPACA_SECRET_KEY
+    from execution.broker import get_broker
+    from execution.strategy import EquityDeepScalper
+    from lumibot.traders import Trader
 
-        broker = get_broker()
-        strategy = EquityDeepScalper(
-            broker=broker,
-            data_bridge=bridge,
-            alpaca_api_key=ALPACA_API_KEY,
-            alpaca_secret_key=ALPACA_SECRET_KEY,
-        )
-        controller.attach(strategy)
-        logger.info("Starting Lumibot trading engine…")
-        strategy.run_live()
-    except Exception as exc:
-        controller.fail(exc)
-        logger.exception("Lumibot thread encountered an unhandled exception:")
+    broker = get_broker()
+    strategy = EquityDeepScalper(
+        broker=broker,
+        data_bridge=bridge,
+        alpaca_api_key=ALPACA_API_KEY,
+        alpaca_secret_key=ALPACA_SECRET_KEY,
+    )
+    trader = Trader()
+    trader.add_strategy(strategy)
+    strategy._trader = trader
+    controller.attach(strategy)
+    controller.trader = trader
+    logger.info("Starting Lumibot trading engine from the main thread…")
+    trader.run_all(
+        async_=True,
+        show_plot=False,
+        show_tearsheet=False,
+        save_tearsheet=False,
+        show_indicators=False,
+    )
 
 
 def _run_dashboard(bridge, controller: EngineController) -> int:
@@ -213,16 +222,15 @@ def main() -> int:
     # already-loaded DLLs instead of initializing them inside the thread.
     import torch  # noqa: F401
 
-    # Start Lumibot in a daemon background thread
+    # Lumibot must start in the main thread because Trader.run_all registers
+    # SIGINT. Its asynchronous executor then runs alongside Qt.
     controller = EngineController(bridge)
-    lumibot_thread = threading.Thread(
-        target=_run_lumibot,
-        args=(bridge, controller),
-        name="LumibotEngine",
-        daemon=True,
-    )
-    lumibot_thread.start()
-    logger.info("Lumibot engine thread started (daemon=True).")
+    try:
+        _start_lumibot(bridge, controller)
+    except Exception as exc:
+        controller.fail(exc)
+        logger.exception("Lumibot startup failed:")
+        return 1
 
     # Give Lumibot a moment to connect before the dashboard appears
     time.sleep(2)
@@ -236,7 +244,10 @@ def main() -> int:
     try:
         if headless_mode:
             logger.info("Headless mode enabled (ALGO_TRADER_HEADLESS=1); dashboard is disabled.")
-            while lumibot_thread.is_alive():
+            while controller.trader and any(
+                getattr(worker, "is_alive", lambda: False)()
+                for worker in getattr(controller.trader, "_pool", [])
+            ):
                 time.sleep(1)
             exit_code = 0
         else:
@@ -248,9 +259,9 @@ def main() -> int:
     if controller.shutdown_confirmed is None:
         if not controller.shutdown():
             exit_code = max(exit_code, 2)
-    lumibot_thread.join(timeout=10)
-    if lumibot_thread.is_alive():
-        logger.error("Lumibot engine did not stop within the bounded join timeout")
+    workers = getattr(controller.trader, "_pool", []) if controller.trader else []
+    if any(getattr(worker, "is_alive", lambda: False)() for worker in workers):
+        logger.error("Lumibot engine did not stop within the bounded shutdown timeout")
         exit_code = max(exit_code, 3)
     if controller.failure is not None:
         exit_code = max(exit_code, 1)
