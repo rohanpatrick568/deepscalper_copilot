@@ -1,187 +1,401 @@
-# DeepScalper supervised paper setup
+# DeepScalper operating guide
 
-DeepScalper is paper-only. The bounded pilot universe is `AAPL`, execution is
-long-only without pyramiding, and the model size branch is disabled in favor
-of fixed risk-capped sizing.
+One guide from a clean machine to a supervised Alpaca **paper** session.
 
-## 1. Windows 11 setup
+Two things are verified separately and must not be confused:
 
-Use 64-bit Python 3.12:
+| | What it proves | How it is checked |
+| --- | --- | --- |
+| **Operational readiness** | The software installs, decides, submits, reconciles, recovers, and shuts down correctly | Offline tests, CI, read-only preflight, bounded smoke order |
+| **Model performance** | The policy is actually worth trading | Training on **real** market data, passing the acceptance gates on validation *and* an untouched holdout |
+
+A tiny synthetic run can only ever prove the first. Synthetic artifacts are
+tagged `"data_source": "synthetic"` and are refused by `promote`.
+
+Supported local execution is **CPU** on macOS (Apple silicon) and Windows 11.
+Google Colab may additionally use CUDA.
+
+> **Only one computer may run the order-submitting engine for a paper account
+> at a time.** Two engines on one account will fight over the same positions
+> and protective orders. Keep virtual environments, credentials, and execution
+> state local to each machine; sync source through Git and move data/models as
+> files.
+
+---
+
+## 1. Clean setup and dependency verification
+
+Requires Python 3.12 and Git. Use a separate virtual environment on each
+computer — never sync `.venv` between machines.
+
+### macOS (Terminal, Apple silicon)
+
+```bash
+git clone https://github.com/rohanpatrick568/deepscalper_copilot.git
+cd deepscalper_copilot
+git checkout fix/supervised-paper-reliability
+
+python3.12 -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip
+python -m pip install -r algo_trader/requirements.txt
+
+python -m pip check
+python -c "import platform; print(platform.platform(), platform.machine())"
+python -c "import alpaca, gymnasium, lumibot, numpy, pandas, torch; print('imports OK')"
+```
+
+### Windows 11 (PowerShell)
 
 ```powershell
-git clone --branch fix/supervised-paper-reliability --single-branch https://github.com/rohanpatrick568/deepscalper_copilot.git
-cd .\deepscalper_copilot
-git rev-parse --verify HEAD
+git clone https://github.com/rohanpatrick568/deepscalper_copilot.git
+cd deepscalper_copilot
+git checkout fix/supervised-paper-reliability
+
 py -3.12 -m venv .venv
-& .\.venv\Scripts\python.exe -m pip install --upgrade pip
-& .\.venv\Scripts\python.exe -m pip install -r .\algo_trader\requirements.txt
-& .\.venv\Scripts\python.exe -m pip check
-Copy-Item .\algo_trader\.env.example .\algo_trader\.env
+.\.venv\Scripts\Activate.ps1
+python -m pip install --upgrade pip
+python -m pip install -r algo_trader\requirements.txt
+
+python -m pip check
+python -c "import platform; print(platform.platform(), platform.machine())"
+python -c "import alpaca, gymnasium, lumibot, numpy, pandas, torch; print('imports OK')"
 ```
 
-Fill only Alpaca **paper** credentials in `.env`. Keep `ALPACA_DATA_FEED=iex`
-unless the account is entitled to SIP. Runtime paths resolve from
-[`algo_trader/`](algo_trader/), not the shell working directory.
+`python -m pip check` must print `No broken requirements found`. Lumibot 3.10.0
+requires NumPy `<2`, which is why NumPy is pinned to 1.26.4.
 
-## 2. Offline validation
+### Run the test suite
 
-This command uses synthetic data and requires no credentials or network:
+```bash
+cd algo_trader
+python -m pytest -q
+```
 
 ```powershell
-cd .\algo_trader
-& ..\.venv\Scripts\python.exe -m workflow offline
-& ..\.venv\Scripts\python.exe -m workflow dry-run
+cd algo_trader
+python -m pytest -q
 ```
 
-`dry-run` executes a real strategy decision and creates an in-memory order,
-while the broker boundary remains untouched.
+Colab and other training-only environments can install
+`algo_trader/requirements-core.txt` instead, which omits the desktop GUI
+dependencies.
 
-To expose the training choice before credentials or model weights exist:
+---
+
+## 2. Choose Local or Colab, then train and evaluate
+
+The choice is explicit and never changed silently. Both locations run the
+**same** module (`colab.deepscalper.training`), the same feature and policy
+definitions, the same chronological splits, and produce the same
+checkpoint + manifest format.
+
+Open the chooser without any model or broker credentials:
+
+```bash
+cd algo_trader
+python main.py --training-setup
+```
+
+or from the CLI:
+
+```bash
+python -m workflow setup --location local     # or --location colab
+```
+
+### 2a. Prepare data
+
+Real training data requires Alpaca **data** credentials (section 4). Training
+itself does not: if you already have a feature file, or you copied one from
+another machine, no credentials are needed.
+
+```bash
+cd algo_trader
+python -m colab.deepscalper.data fetch --symbol AAPL \
+  --start 2024-01-01 --end 2025-01-01 --feed iex --adjustment raw \
+  --output data/AAPL_raw.parquet
+python -m colab.deepscalper.data features \
+  --input data/AAPL_raw.parquet --output data/AAPL_features.npz
+```
+
+### 2b. Local CPU training
+
+```bash
+cd algo_trader
+python -m colab.deepscalper.training train \
+  --data data/AAPL_features.npz \
+  --output-dir runs/AAPL --symbol AAPL \
+  --location local --device cpu --epochs 20 \
+  --min-position-changes 2
+```
 
 ```powershell
-& ..\.venv\Scripts\python.exe -m workflow setup --location local
-& ..\.venv\Scripts\python.exe -m workflow setup --location colab
+cd algo_trader
+python -m colab.deepscalper.training train `
+  --data data\AAPL_features.npz `
+  --output-dir runs\AAPL --symbol AAPL `
+  --location local --device cpu --epochs 20 `
+  --min-position-changes 2
 ```
 
-## 3. Read-only Alpaca preflight
+* **Resume**: re-run the same command with `--resume`. Resume refuses to
+  continue if the symbol, data, model, feature schema, or policy configuration
+  changed.
+* **Cancel**: pass `--cancel-file runs/AAPL/CANCEL` and create that file to
+  stop cleanly. Interrupting with Ctrl+C also keeps the last valid checkpoint.
+* **Device**: `--device cpu` is the supported local default. `--device auto`
+  falls back to CPU and reports the fallback. `--device cuda` fails loudly
+  rather than silently training elsewhere.
+
+### 2c. Evaluate and read the decision
+
+```bash
+python -m colab.deepscalper.training evaluate \
+  --checkpoint runs/AAPL/best.pth --manifest runs/AAPL/best.manifest.json \
+  --data data/AAPL_features.npz --split holdout --device cpu
+
+python -m colab.deepscalper.training verify \
+  --checkpoint runs/AAPL/best.pth --manifest runs/AAPL/best.manifest.json
+```
+
+**Rejection handling.** `train` exits `2` when the model is not accepted, and
+`best.manifest.json` lists every failed gate under `"rejections"`, for example:
+
+```
+validation.position_changes 0 < required 2 (a flat, zero-trade policy cannot be approved)
+holdout.return -0.013000 < required 0.000000
+holdout.max_drawdown 0.180000 > allowed 0.100000
+```
+
+Gates cover net return after modelled costs on **both** validation and the
+untouched holdout, holdout drawdown, and a positive activity requirement. A
+flat, zero-trade policy can never be approved. **Do not lower the thresholds
+to force an approval** — retrain, change features, or accept that the model is
+not tradeable. Evaluation applies the same entry filters, minimum holding
+period, cooldown, long-only rule, and protective exits that paper execution
+applies; simulated protective exits approximate the runtime ATR stops on bar
+closes, so this is approximate fill behaviour, not fill parity.
+
+### 2d. Google Colab
+
+Open `algo_trader/colab/03_train_deepscalper.ipynb` in Colab (the chooser's
+**Open Colab launcher** button links to it). You start and authorize the
+session yourself; nothing here launches remote compute for you.
+
+1. **Bootstrap cell** — mounts Drive, clones/updates the repository, and checks
+   out the revision in `REVISION` (set it to `fix/supervised-paper-reliability`
+   or a commit SHA). Safe to re-run after a disconnect.
+2. **Device cell** — `DEVICE = 'auto'` uses CUDA when present and otherwise
+   reports a CPU fallback; `'cuda'` requires a GPU runtime
+   (Runtime → Change runtime type → T4 GPU); `'cpu'` forces CPU.
+3. **Config cell** — set `DATA` and `OUTPUT` under
+   `/content/drive/MyDrive/...` so checkpoints survive a runtime restart.
+4. **Training cell** — resumes automatically when `latest.pth` and
+   `training_state.json` exist. Re-run it after an interruption.
+5. **Verify cell** — prints `accepted`, the metrics, and any rejections.
+6. **Download cell** — downloads `best.pth` and `best.manifest.json`.
+
+---
+
+## 3. Move artifacts between machines and load on CPU
+
+Transfer `best.pth` and `best.manifest.json` as files (Drive, USB, scp). Do not
+commit them.
+
+Confirm the artifact loads on CPU regardless of the training device:
+
+```bash
+cd algo_trader
+python -m scripts.verify_artifact_cpu \
+  --checkpoint best.pth --manifest best.manifest.json
+```
+
+Import an **approved** model into the paper runtime:
+
+```bash
+python -m colab.deepscalper.training promote \
+  --checkpoint best.pth --manifest best.manifest.json \
+  --weights-dir weights --symbol AAPL
+```
 
 ```powershell
-& ..\.venv\Scripts\python.exe -m workflow preflight
+python -m colab.deepscalper.training promote `
+  --checkpoint best.pth --manifest best.manifest.json `
+  --weights-dir weights --symbol AAPL
 ```
 
-Preflight reads the paper account status, blocks, buying power, positions,
-open orders, broker clock/calendar, AAPL eligibility, configured feed access,
-and actual completed-bar freshness. It reports model readiness separately and
-never submits, replaces, cancels, or closes an order.
+`promote` refuses artifacts that failed the gates, artifacts trained on
+synthetic data, mismatched checksums, and stale feature/action/policy schema
+versions. Changing policy semantics bumps the policy version, which forces
+affected artifacts to be re-evaluated before they can be promoted again.
 
-## 4. Explicit bounded paper round trip
+---
 
-Use a supervised paper account and first confirm preflight reports no AAPL
-position or open AAPL order:
+## 4. Paper credentials
+
+Use **paper** keys only, from <https://app.alpaca.markets/paper/dashboard/overview>.
+Never commit or print them.
+
+### Shell session variables (not persisted)
+
+macOS Terminal — lasts only for the current terminal session:
+
+```bash
+export ALPACA_API_KEY='YOUR_PAPER_API_KEY'
+export ALPACA_SECRET_KEY='YOUR_PAPER_SECRET_KEY'
+```
+
+Windows PowerShell — lasts only for the current PowerShell window:
 
 ```powershell
-& ..\.venv\Scripts\python.exe -m workflow paper-smoke `
-  --confirm-paper-smoke `
-  --symbol AAPL `
-  --notional 20 `
-  --max-orders 2 `
-  --timeout-seconds 120
+$env:ALPACA_API_KEY = 'YOUR_PAPER_API_KEY'
+$env:ALPACA_SECRET_KEY = 'YOUR_PAPER_SECRET_KEY'
 ```
 
-This model-independent command verifies the paper endpoint, buys at most the
-configured notional using one fractional market order, sells exactly the
-reconciled test quantity with one order, and succeeds only after Alpaca
-confirms AAPL flat and both test orders terminal. It refuses dirty AAPL state
-and leaves unrelated symbols untouched. If a price jump makes the reconciled
-position exceed `MAX_ORDER_NOTIONAL`, recovery does not bypass the cap: it
-reports `UNRESOLVED PAPER-SMOKE EXPOSURE` and requires supervised manual
-flattening in the paper account.
-
-## 5. Local training and evaluation
-
-Core training supports Windows CPU. Set `--device cuda` only when the installed
-PyTorch build and hardware report CUDA support; the selected device is recorded
-and is never changed silently.
-
-Prepare a portable feature file from chronological raw AAPL minute bars:
+To persist on Windows for your user account (new windows only):
 
 ```powershell
-& ..\.venv\Scripts\python.exe -m colab.deepscalper.data features `
-  --input .\data\AAPL_raw.parquet `
-  --output .\data\AAPL_features.npz
+[Environment]::SetEnvironmentVariable('ALPACA_API_KEY', 'YOUR_PAPER_API_KEY', 'User')
+[Environment]::SetEnvironmentVariable('ALPACA_SECRET_KEY', 'YOUR_PAPER_SECRET_KEY', 'User')
 ```
 
-Run a small synthetic plumbing test (not a performance approval):
+### The `.env` file
+
+The project reads exactly one file: **`algo_trader/.env`**. No other location
+is searched, and the current working directory is irrelevant.
+
+**Precedence: real environment variables win.** `.env` only fills in variables
+that are *not* already set in the environment. If `ALPACA_API_KEY` is exported
+in your shell, the `.env` value is ignored.
+
+```bash
+cp algo_trader/.env.example algo_trader/.env   # then edit it
+```
 
 ```powershell
-& ..\.venv\Scripts\python.exe -m colab.deepscalper.training train `
-  --synthetic --tiny --epochs 1 --location local --device cpu `
-  --output-dir .\runs\AAPL-smoke --symbol AAPL
+Copy-Item algo_trader\.env.example algo_trader\.env   # then edit it
 ```
 
-Run/restart the production-shape one-symbol workflow:
+`algo_trader/.env` is gitignored. Keep it out of Git, screenshots, and logs.
+
+---
+
+## 5. Offline checks → preflight → smoke order → supervised session
+
+Run these **in order**. Each step is a gate for the next.
+
+### 5a. Offline (no credentials, no network)
+
+```bash
+cd algo_trader
+python -m pytest -q
+python -m workflow offline
+python -m workflow dry-run
+```
+
+`dry-run` executes the real decision loop and reports
+`"broker_submissions": 0`. The no-order modes are enforced at the broker
+boundary, so offline, preflight, and dry-run cannot mutate the account through
+any submission, replacement, cancellation, bulk-order, or close-position path.
+
+### 5b. Read-only preflight (credentials, no orders)
+
+```bash
+python -m workflow preflight
+```
+
+Inspects account status and permissions, buying power, positions, open orders,
+the clock/calendar, asset eligibility, and live bar freshness — **without
+placing any order**. Model readiness is reported separately, so this
+connectivity check does not require an approved model.
+
+Proceed only when `"connectivity_ready": true`.
+
+### 5c. Bounded paper smoke order (explicitly opted in, places 2 orders)
+
+This is the first step that submits real paper orders. It is a deterministic
+plumbing test and does **not** need an approved model. Run it during regular
+market hours and watch it.
+
+```bash
+python -m workflow paper-smoke --confirm-paper-smoke \
+  --symbol AAPL --notional 20 --timeout-seconds 120
+```
 
 ```powershell
-& ..\.venv\Scripts\python.exe -m colab.deepscalper.training train `
-  --data .\data\AAPL_features.npz --epochs 20 --location local --device cpu `
-  --output-dir .\runs\AAPL --symbol AAPL
-
-& ..\.venv\Scripts\python.exe -m colab.deepscalper.training train `
-  --data .\data\AAPL_features.npz --epochs 20 --location local --device cpu `
-  --output-dir .\runs\AAPL --symbol AAPL --resume
+python -m workflow paper-smoke --confirm-paper-smoke `
+  --symbol AAPL --notional 20 --timeout-seconds 120
 ```
 
-Ctrl+C cancels local execution. `latest.pth` and `training_state.json` preserve
-the last completed epoch; `--resume` restores model, optimizer, step, epoch,
-and best-validation state. The replay buffer is deliberately not serialized
-and this fact is recorded in the manifest.
+It verifies the paper endpoint, requires an open session and a clean state for
+the test symbol, uses stable client order IDs, and is capped at two orders
+within the configured notional limits. It buys a small fractional notional and
+sells only the position it created; unrelated holdings are untouched.
 
-Evaluate and promote only the selected accepted model:
+Success requires broker-confirmed terminal orders and a flat test position:
+
+```json
+{"flat_confirmed": true, "all_orders_terminal": true, ...}
+```
+
+**If it reports `UNRESOLVED PAPER-SMOKE EXPOSURE`**, it deliberately stopped
+submitting rather than risk overselling. The message lists the order IDs,
+client order IDs, and the remaining quantity. Open the Alpaca paper dashboard,
+wait for or cancel the non-terminal order, and flatten the remaining quantity
+yourself. Do not re-run the smoke test until the symbol is clean again.
+
+### 5d. Supervised model-driven paper session
+
+Only after 5a–5c pass **and** an approved model has been promoted:
+
+```bash
+cd algo_trader
+python main.py
+```
 
 ```powershell
-& ..\.venv\Scripts\python.exe -m colab.deepscalper.training evaluate `
-  --data .\data\AAPL_features.npz `
-  --checkpoint .\runs\AAPL\best.pth `
-  --manifest .\runs\AAPL\best.manifest.json --split holdout --device cpu
-
-& ..\.venv\Scripts\python.exe -m colab.deepscalper.training promote `
-  --checkpoint .\runs\AAPL\best.pth `
-  --manifest .\runs\AAPL\best.manifest.json `
-  --weights-dir .\weights --symbol AAPL
+cd algo_trader
+python main.py
 ```
 
-Promotion rejects failed gates, checksum/schema mismatch, non-production
-architecture, or the wrong symbol.
+Stay at the machine. The engine is long-only, does not pyramid, uses bounded
+fixed sizing with broker-held protection, halts new entries on the session loss
+limit while continuing to manage open positions, and closes before the
+exchange's early close.
 
-## 6. Google Colab training and resume
+### Stopping and recovery
 
-The user must open and authorize Colab; this repository does not launch paid
-compute.
+* **Graceful stop** — close the dashboard window, or press **Ctrl+C**. Both run
+  the same bounded, verified shutdown. Flattening is only reported as
+  successful when the broker confirms it.
+* **Exit status** — `0` clean; `1` engine failure; `2` shutdown not confirmed;
+  `3` the engine did not stop within the bounded timeout. A non-zero status
+  means **check the account manually**.
+* **Emergency** — use the dashboard's cancel/flatten controls, or flatten
+  directly in the Alpaca paper dashboard. The Alpaca UI is always the
+  authoritative view.
+* **Restart** — on startup the engine reconstructs positions, orders,
+  protection, and the session-loss baseline from its ledger and reconciles them
+  against Alpaca before any new entry is allowed.
 
-1. Open [`algo_trader/colab/01_fetch_training_data.ipynb`](algo_trader/colab/01_fetch_training_data.ipynb)
-   in Colab.
-2. The launcher mounts/remounts Drive, checks out
-   `fix/supervised-paper-reliability`, prints the checked-out SHA, and installs
-   `requirements-core.txt`. Re-running the cell fetches and fast-forwards the
-   same branch instead of cloning `main`.
-3. Add `ALPACA_API_KEY`/`ALPACA_SECRET_KEY` to Colab secrets only for the
-   credentialed data-fetch cell; synthetic training needs neither.
-4. Run notebooks 01 and 02. They call the same `deepscalper.data` package and
-   persist raw data and `AAPL_features.npz` in Drive.
-5. In notebook 03, leave `--location colab` explicit. Set `RESUME=True`; after
-   interruption it reuses Drive-backed `latest.pth`.
-6. Run notebook 05 for greedy holdout evaluation, then notebook 04 to validate
-   and export the accepted best checkpoint plus manifest.
-7. Download `best.pth` and `best.manifest.json` from Drive to a local staging
-   directory and run the same `verify` and `promote` commands shown above.
+### Where to look
 
-Colab GPU availability, Drive authorization, data entitlement, and the
-interactive training duration are external checks and are not claimed by CI.
+| What | Where |
+| --- | --- |
+| Application log | `algo_trader/algo_trader.log` |
+| Durable order/position/protection ledger | `algo_trader/runtime/execution-state.json` (or `EXECUTION_STATE_PATH`) |
+| Decisions, skip reasons, feed and bar age | application log (`decision=`, `skip`, `feed`) |
+| Authoritative orders and positions | Alpaca paper dashboard |
+| Training runs and manifests | `algo_trader/runs/<SYMBOL>/` |
+| Approved weights | `algo_trader/weights/` |
 
-## 7. Model-driven paper session
+---
 
-Model-driven startup requires the promoted `weights/AAPL.pth` and
-`weights/AAPL.manifest.json` pair:
+## Quick checklist
 
-```powershell
-$env:ALGO_TRADER_RUN_MODE = "paper"
-& ..\.venv\Scripts\python.exe .\main.py
-```
-
-The dashboard wires manual position close, emergency cancel/flatten, Local /
-Google Colab guidance, and bounded window-close shutdown through reconciled
-strategy controls. A nonzero exit means the engine failed or Alpaca did not
-confirm flat/terminal state before timeout.
-
-## Verification
-
-```powershell
-& ..\.venv\Scripts\python.exe -m compileall -q .
-& ..\.venv\Scripts\python.exe -m pytest -q
-```
-
-Operational readiness means installation, preflight, no-order enforcement,
-recovery, and broker reconciliation pass. Model-performance validation is
-separate: a promoted model must pass chronological validation and untouched
-holdout gates after realistic costs and terminal liquidation. A plumbing
-smoke test never approves trading performance.
+1. Install and `pip check` on each machine; run `pytest -q`.
+2. Fetch real data, train Local or Colab, and read `"rejections"`.
+3. Promote only an **accepted**, non-synthetic artifact.
+4. `workflow offline` → `workflow dry-run` → `workflow preflight`.
+5. `workflow paper-smoke --confirm-paper-smoke`, confirm flat.
+6. `python main.py` on **one** machine, supervised.

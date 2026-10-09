@@ -227,6 +227,11 @@ def _parser() -> argparse.ArgumentParser:
     smoke.add_argument("--symbol", default=TRADING_UNIVERSE[0])
     smoke.add_argument("--notional", type=Decimal, default=Decimal("20"))
     smoke.add_argument("--timeout-seconds", type=float, default=120.0)
+    smoke.add_argument(
+        "--cleanup-timeout-seconds",
+        type=float,
+        help="separate budget for flattening the test position (defaults to --timeout-seconds)",
+    )
     smoke.add_argument("--max-orders", type=int, default=2)
     return parser
 
@@ -298,6 +303,7 @@ def main(argv=None) -> int:
             symbol=args.symbol,
             notional=args.notional,
             timeout_seconds=args.timeout_seconds,
+            cleanup_timeout_seconds=args.cleanup_timeout_seconds,
             max_orders=args.max_orders,
             confirmed=True,
         )
