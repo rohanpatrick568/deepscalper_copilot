@@ -445,6 +445,142 @@ def test_repeated_bar_runs_model_once(tmp_path, monkeypatch):
     assert model.calls == 1
 
 
+def test_repeated_long_signal_maintains_the_live_position(tmp_path, monkeypatch):
+    """Regression: a repeated LONG must not churn an existing long flat."""
+    strategy, runtime, position = _strategy(tmp_path, monkeypatch)
+    strategy._entry_side["AAPL"] = "buy"
+    strategy._entry_prices["AAPL"] = 100.0
+    strategy._filled_entry_qty["AAPL"] = 5
+
+    class LongModel:
+        def __call__(self, lob, private, macro):
+            return (
+                strategy_module.torch.tensor([[0.0, 0.0, 6.0]]),
+                strategy_module.torch.zeros((1, 1)),
+            )
+
+    strategy._models = {"AAPL": LongModel()}
+    end = pd.Timestamp.now(tz="UTC").floor("min") - pd.Timedelta(minutes=1)
+    for offset in range(3):
+        index = pd.date_range(
+            end=end - pd.Timedelta(minutes=offset), periods=65, freq="1min"
+        )
+        bars = pd.DataFrame(
+            {
+                "open": 100.0,
+                "high": 100.5,
+                "low": 99.8,
+                "close": 100.0,
+                "volume": 100.0,
+            },
+            index=index,
+        )
+        strategy.get_historical_prices = lambda *a, _bars=bars, **k: SimpleNamespace(
+            df=_bars
+        )
+        strategy._iteration_index += 1
+        strategy._process_symbol("AAPL", 1_000.0, {"AAPL": position})
+
+    # No exit and no pyramiding entry: the existing long is simply maintained.
+    assert runtime.submissions == []
+
+
+def test_flat_model_exits_the_live_position_once(tmp_path, monkeypatch):
+    strategy, runtime, position = _strategy(tmp_path, monkeypatch)
+    strategy._entry_side["AAPL"] = "buy"
+    strategy._entry_prices["AAPL"] = 100.0
+    strategy._filled_entry_qty["AAPL"] = 5
+
+    class FlatModel:
+        def __call__(self, lob, private, macro):
+            return (
+                strategy_module.torch.tensor([[0.0, 6.0, 0.0]]),
+                strategy_module.torch.zeros((1, 1)),
+            )
+
+    strategy._models = {"AAPL": FlatModel()}
+    end = pd.Timestamp.now(tz="UTC").floor("min") - pd.Timedelta(minutes=1)
+    index = pd.date_range(end=end, periods=65, freq="1min")
+    bars = pd.DataFrame(
+        {
+            "open": 100.0,
+            "high": 100.5,
+            "low": 99.8,
+            "close": 100.0,
+            "volume": 100.0,
+        },
+        index=index,
+    )
+    strategy.get_historical_prices = lambda *a, **k: SimpleNamespace(df=bars)
+    strategy._process_symbol("AAPL", 1_000.0, {"AAPL": position})
+    assert [(order.side, order.quantity) for order in runtime.submissions] == [
+        ("sell", 5)
+    ]
+
+
+def test_long_only_short_signal_exits_rather_than_shorting(tmp_path, monkeypatch):
+    strategy, runtime, position = _strategy(tmp_path, monkeypatch)
+    strategy._entry_side["AAPL"] = "buy"
+    strategy._entry_prices["AAPL"] = 100.0
+    strategy._filled_entry_qty["AAPL"] = 5
+
+    class ShortModel:
+        def __call__(self, lob, private, macro):
+            return (
+                strategy_module.torch.tensor([[6.0, 0.0, 0.0]]),
+                strategy_module.torch.zeros((1, 1)),
+            )
+
+    strategy._models = {"AAPL": ShortModel()}
+    end = pd.Timestamp.now(tz="UTC").floor("min") - pd.Timedelta(minutes=1)
+    index = pd.date_range(end=end, periods=65, freq="1min")
+    bars = pd.DataFrame(
+        {
+            "open": 100.0,
+            "high": 100.5,
+            "low": 99.8,
+            "close": 100.0,
+            "volume": 100.0,
+        },
+        index=index,
+    )
+    strategy.get_historical_prices = lambda *a, **k: SimpleNamespace(df=bars)
+    strategy._process_symbol("AAPL", 1_000.0, {"AAPL": position})
+
+    sides = [order.side for order in runtime.submissions]
+    assert sides == ["sell"]
+    # The long is closed; no short is opened in long-only mode.
+    assert all(order.quantity == 5 for order in runtime.submissions)
+
+
+def test_long_only_short_signal_opens_nothing_when_flat(tmp_path, monkeypatch):
+    strategy, runtime, _ = _strategy(tmp_path, monkeypatch, quantity=0)
+
+    class ShortModel:
+        def __call__(self, lob, private, macro):
+            return (
+                strategy_module.torch.tensor([[6.0, 0.0, 0.0]]),
+                strategy_module.torch.zeros((1, 1)),
+            )
+
+    strategy._models = {"AAPL": ShortModel()}
+    end = pd.Timestamp.now(tz="UTC").floor("min") - pd.Timedelta(minutes=1)
+    index = pd.date_range(end=end, periods=65, freq="1min")
+    bars = pd.DataFrame(
+        {
+            "open": 100.0,
+            "high": 100.5,
+            "low": 99.8,
+            "close": 100.0,
+            "volume": 100.0,
+        },
+        index=index,
+    )
+    strategy.get_historical_prices = lambda *a, **k: SimpleNamespace(df=bars)
+    strategy._process_symbol("AAPL", 1_000.0, {})
+    assert runtime.submissions == []
+
+
 def test_shutdown_only_succeeds_after_fake_broker_confirms_flat(
     tmp_path, monkeypatch
 ):

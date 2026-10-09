@@ -27,6 +27,13 @@ class FakePaperClient:
         self.cancelled = []
         self.buy_fill_price = Decimal("100")
         self.current_price = Decimal("100")
+        # Keeps the buy in a non-terminal state no matter how long we poll.
+        self.stick_buy_status: str | None = None
+        # Raises on the Nth submit_order call to simulate an unknown outcome.
+        self.raise_on_submit: int | None = None
+        # Number of polls the buy spends working before it fills.
+        self.buy_poll_delay = 0
+        self._buy_polls = 0
 
     def get_asset(self, symbol):
         return SimpleNamespace(
@@ -48,6 +55,7 @@ class FakePaperClient:
 
     def submit_order(self, request):
         fields = request.to_request_fields()
+        ambiguous = self.raise_on_submit == len(self.submitted) + 1
         order = SimpleNamespace(
             id=f"order-{len(self.submitted) + 1}",
             symbol=fields["symbol"],
@@ -73,13 +81,40 @@ class FakePaperClient:
                 for position in self.positions
                 if position.symbol != fields["symbol"]
             ]
+        if str(fields["side"]).lower().endswith("buy"):
+            if self.stick_buy_status is not None:
+                order.status = self.stick_buy_status
+            elif self.buy_poll_delay:
+                order.status = "new"
+        if ambiguous:
+            raise RuntimeError("connection reset after the order was accepted")
         return order
 
     def get_order_by_id(self, order_id):
-        return self.orders[order_id]
+        order = self.orders[order_id]
+        if (
+            str(order.side).lower().endswith("buy")
+            and self.stick_buy_status is None
+            and order.status == "new"
+        ):
+            self._buy_polls += 1
+            if self._buy_polls >= self.buy_poll_delay:
+                order.status = "filled"
+        return order
+
+    def get_order_by_client_id(self, client_order_id):
+        for order in self.orders.values():
+            if order.client_order_id == client_order_id:
+                return self.get_order_by_id(order.id)
+        raise KeyError(client_order_id)
 
     def cancel_order_by_id(self, order_id):
         self.cancelled.append(order_id)
+        if self.stick_buy_status is not None and str(
+            self.orders[order_id].side
+        ).lower().endswith("buy"):
+            # The broker acknowledges the cancel but the order keeps working.
+            return
         self.orders[order_id].status = "canceled"
 
 
@@ -161,6 +196,74 @@ def test_paper_smoke_reports_price_jump_exposure_without_over_cap_cleanup():
     assert "No further smoke orders were submitted" in str(error)
     assert len(client.submitted) == 1
     assert [position.symbol for position in client.positions] == ["MSFT", "AAPL"]
+
+
+def test_paper_smoke_submits_no_cleanup_while_the_buy_is_nonterminal():
+    """A cancel request is not confirmation; a working buy must stop the test."""
+    client = FakePaperClient()
+    client.stick_buy_status = "partially_filled"
+
+    with pytest.raises(UnresolvedSmokeExposure) as captured:
+        run_paper_round_trip(
+            client,
+            symbol="AAPL",
+            notional=Decimal("20"),
+            timeout_seconds=0.01,
+            confirmed=True,
+            sleep_fn=lambda _: None,
+        )
+
+    error = captured.value
+    # Exactly one order was ever submitted: no cleanup sell was calculated.
+    assert len(client.submitted) == 1
+    assert [str(order["side"]).lower().endswith("buy") for order in client.submitted] == [
+        True
+    ]
+    assert client.cancelled == ["order-1"]
+    assert "never reached a broker-confirmed terminal state" in str(error)
+    assert error.order_ids == ("order-1",)
+    assert error.client_order_ids[0].endswith("-buy")
+    assert "Recover manually" in str(error)
+
+
+def test_paper_smoke_resolves_ambiguous_submission_by_client_order_id():
+    """An unknown submission outcome is recovered, never re-submitted."""
+    client = FakePaperClient()
+    client.raise_on_submit = 1
+
+    result = run_paper_round_trip(
+        client,
+        symbol="AAPL",
+        notional=Decimal("20"),
+        timeout_seconds=1,
+        confirmed=True,
+        sleep_fn=lambda _: None,
+    )
+
+    assert result["flat_confirmed"]
+    # The ambiguous buy was recovered by client order ID rather than retried.
+    assert len(client.submitted) == 2
+    assert [position.symbol for position in client.positions] == ["MSFT"]
+
+
+def test_paper_smoke_gives_cleanup_its_own_timeout_budget():
+    """A slow buy must not consume the budget needed to flatten the position."""
+    client = FakePaperClient()
+    client.buy_poll_delay = 2
+
+    result = run_paper_round_trip(
+        client,
+        symbol="AAPL",
+        notional=Decimal("20"),
+        timeout_seconds=5,
+        cleanup_timeout_seconds=5,
+        confirmed=True,
+        sleep_fn=lambda _: None,
+    )
+
+    assert result["flat_confirmed"]
+    assert result["all_orders_terminal"]
+    assert client.cancelled == []
 
 
 def test_read_only_preflight_checks_account_calendar_asset_and_fresh_bars(

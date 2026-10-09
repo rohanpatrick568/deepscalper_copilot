@@ -18,6 +18,7 @@ from colab.deepscalper.data import prepare_features
 from colab.deepscalper.policy import POLICY_VERSION
 from colab.deepscalper.training import (
     MarketData,
+    _acceptance_rejections,
     ModelConfig,
     TrainConfig,
     evaluate,
@@ -278,3 +279,63 @@ def test_training_epoch_visits_every_training_day(monkeypatch):
         agent, Env(), seed=1, max_steps=None
     )
     assert agent.days == [0, 1, 2]
+
+
+def _metrics(**overrides):
+    base = {
+        "return": 0.05,
+        "position_changes": 8,
+        "max_drawdown": 0.02,
+    }
+    base.update(overrides)
+    return base
+
+
+ACCEPTANCE = {
+    "min_validation_return": 0.0,
+    "min_holdout_return": 0.0,
+    "max_holdout_drawdown": 0.10,
+    "minimum_position_changes": 2,
+}
+
+
+def test_profitable_active_policy_passes_every_gate():
+    assert _acceptance_rejections(_metrics(), _metrics(), ACCEPTANCE) == []
+
+
+def test_flat_zero_trade_policy_is_rejected_on_both_splits():
+    """A do-nothing policy returns 0.0 and must never satisfy the gates."""
+    flat = _metrics(**{"return": 0.0, "position_changes": 0})
+    reasons = _acceptance_rejections(flat, flat, ACCEPTANCE)
+    assert len(reasons) == 2
+    assert any(reason.startswith("validation.position_changes 0") for reason in reasons)
+    assert any(reason.startswith("holdout.position_changes 0") for reason in reasons)
+
+
+def test_activity_is_required_on_the_holdout_even_when_validation_trades():
+    reasons = _acceptance_rejections(
+        _metrics(), _metrics(position_changes=0), ACCEPTANCE
+    )
+    assert reasons == [
+        "holdout.position_changes 0 < required 2 "
+        "(a flat, zero-trade policy cannot be approved)"
+    ]
+
+
+def test_negative_returns_and_excess_drawdown_are_reported_together():
+    reasons = _acceptance_rejections(
+        _metrics(**{"return": -0.01}),
+        _metrics(**{"return": -0.02, "max_drawdown": 0.5}),
+        ACCEPTANCE,
+    )
+    assert len(reasons) == 3
+    assert any("validation.return" in reason for reason in reasons)
+    assert any("holdout.return" in reason for reason in reasons)
+    assert any("max_drawdown" in reason for reason in reasons)
+
+
+def test_non_finite_return_is_rejected():
+    reasons = _acceptance_rejections(
+        _metrics(**{"return": float("nan")}), _metrics(), ACCEPTANCE
+    )
+    assert reasons == ["validation.return is not finite"]
