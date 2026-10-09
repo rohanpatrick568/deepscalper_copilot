@@ -72,7 +72,10 @@ This model-independent command verifies the paper endpoint, buys at most the
 configured notional using one fractional market order, sells exactly the
 reconciled test quantity with one order, and succeeds only after Alpaca
 confirms AAPL flat and both test orders terminal. It refuses dirty AAPL state
-and leaves unrelated symbols untouched.
+and leaves unrelated symbols untouched. If a price jump makes the reconciled
+position exceed `MAX_ORDER_NOTIONAL`, recovery does not bypass the cap: it
+reports `UNRESOLVED PAPER-SMOKE EXPOSURE` and requires supervised manual
+flattening in the paper account.
 
 ## 5. Local training and evaluation
 

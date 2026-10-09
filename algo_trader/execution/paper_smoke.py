@@ -16,12 +16,55 @@ from execution.preflight import verify_paper_client
 TERMINAL = {"filled", "canceled", "cancelled", "expired", "rejected"}
 
 
+class UnresolvedSmokeExposure(RuntimeError):
+    """The smoke position cannot be flattened without violating its limits."""
+
+    def __init__(
+        self,
+        *,
+        symbol: str,
+        quantity: Decimal,
+        estimated_notional: Decimal | None,
+        max_order_notional: Decimal,
+        reason: str,
+    ) -> None:
+        notional = (
+            f"${estimated_notional:.2f}"
+            if estimated_notional is not None
+            else "unknown"
+        )
+        super().__init__(
+            f"UNRESOLVED PAPER-SMOKE EXPOSURE: {quantity} {symbol}; "
+            f"estimated notional={notional}, order cap=${max_order_notional:.2f}. "
+            f"{reason} No over-limit cleanup order was submitted; inspect the paper "
+            "account and flatten manually."
+        )
+        self.symbol = symbol
+        self.quantity = quantity
+        self.estimated_notional = estimated_notional
+        self.max_order_notional = max_order_notional
+
+
 def _status(order: Any) -> str:
     return str(getattr(order, "status", "")).split(".")[-1].lower()
 
 
 def _symbol(item: Any) -> str:
     return str(getattr(item, "symbol", getattr(getattr(item, "asset", None), "symbol", "")))
+
+
+def _position_notional(position: Any, quantity: Decimal) -> Decimal | None:
+    current_price = getattr(position, "current_price", None)
+    if current_price is not None:
+        price = Decimal(str(current_price))
+        if price > 0:
+            return quantity * price
+    market_value = getattr(position, "market_value", None)
+    if market_value is not None:
+        value = abs(Decimal(str(market_value)))
+        if value > 0:
+            return value
+    return None
 
 
 def run_paper_round_trip(
@@ -134,6 +177,24 @@ def run_paper_round_trip(
         if len(positions) != 1 or Decimal(str(positions[0].qty)) <= 0:
             raise RuntimeError("Smoke cleanup found an unexpected test-symbol position") from failure
         test_qty = Decimal(str(positions[0].qty))
+        order_cap = Decimal(str(MAX_ORDER_NOTIONAL))
+        cleanup_notional = _position_notional(positions[0], test_qty)
+        if cleanup_notional is None:
+            raise UnresolvedSmokeExposure(
+                symbol=symbol,
+                quantity=test_qty,
+                estimated_notional=None,
+                max_order_notional=order_cap,
+                reason="The broker position has no usable current price or market value.",
+            ) from failure
+        if cleanup_notional > order_cap:
+            raise UnresolvedSmokeExposure(
+                symbol=symbol,
+                quantity=test_qty,
+                estimated_notional=cleanup_notional,
+                max_order_notional=order_cap,
+                reason="Flattening the full position would exceed the configured per-order cap.",
+            ) from failure
         if len(own_orders) >= max_orders:
             raise RuntimeError("Smoke exhausted its bounded order count before flattening") from failure
         sell_id = f"{prefix}-sell"

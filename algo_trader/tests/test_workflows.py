@@ -8,7 +8,7 @@ import pandas as pd
 import pytest
 
 import execution.preflight as preflight_module
-from execution.paper_smoke import run_paper_round_trip
+from execution.paper_smoke import UnresolvedSmokeExposure, run_paper_round_trip
 from execution.preflight import run_read_only_preflight
 from workflow import offline_validation, synthetic_dry_run
 from dashboard.data_bridge import DataBridge
@@ -25,6 +25,8 @@ class FakePaperClient:
         self.orders = {}
         self.submitted = []
         self.cancelled = []
+        self.buy_fill_price = Decimal("100")
+        self.current_price = Decimal("100")
 
     def get_asset(self, symbol):
         return SimpleNamespace(
@@ -56,8 +58,14 @@ class FakePaperClient:
         self.submitted.append(fields)
         self.orders[order.id] = order
         if str(fields["side"]).lower().endswith("buy"):
+            quantity = Decimal(str(fields["notional"])) / self.buy_fill_price
             self.positions.append(
-                SimpleNamespace(symbol=fields["symbol"], qty="0.1")
+                SimpleNamespace(
+                    symbol=fields["symbol"],
+                    qty=str(quantity),
+                    current_price=str(self.current_price),
+                    market_value=str(quantity * self.current_price),
+                )
             )
         else:
             self.positions = [
@@ -130,6 +138,29 @@ def test_paper_smoke_requires_explicit_confirmation_and_clean_symbol():
             timeout_seconds=1,
             confirmed=True,
         )
+
+
+def test_paper_smoke_reports_price_jump_exposure_without_over_cap_cleanup():
+    client = FakePaperClient()
+    client.current_price = Decimal("200")
+
+    with pytest.raises(UnresolvedSmokeExposure) as captured:
+        run_paper_round_trip(
+            client,
+            symbol="AAPL",
+            notional=Decimal("20"),
+            timeout_seconds=1,
+            confirmed=True,
+            sleep_fn=lambda _: None,
+        )
+
+    error = captured.value
+    assert error.quantity == Decimal("0.2")
+    assert error.estimated_notional == Decimal("40.0")
+    assert error.max_order_notional == Decimal("30.0")
+    assert "No over-limit cleanup order was submitted" in str(error)
+    assert len(client.submitted) == 1
+    assert [position.symbol for position in client.positions] == ["MSFT", "AAPL"]
 
 
 def test_read_only_preflight_checks_account_calendar_asset_and_fresh_bars(
