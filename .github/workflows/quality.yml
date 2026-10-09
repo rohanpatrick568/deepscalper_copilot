@@ -6,16 +6,64 @@ on:
 
 jobs:
   tests:
-    runs-on: windows-latest
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # macos-14 and later are native Apple-silicon (arm64) runners, matching
+          # the M1 Pro development laptop. An Intel macOS runner would not be
+          # evidence of Apple-silicon support.
+          - os: macos-14
+            name: macOS arm64 CPU
+            shell: bash
+          - os: windows-latest
+            name: Windows x86_64 CPU
+            shell: pwsh
+    defaults:
+      run:
+        shell: ${{ matrix.shell }}
+        working-directory: algo_trader
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - run: python -m pip install --upgrade pip
-      - run: python -m pip install -r algo_trader/requirements.txt
-      - run: python -m pip check
-      - run: python -c "import alpaca, gymnasium, lumibot, numpy, pandas, torch; print('runtime imports OK')"
-      - run: python -m compileall -q algo_trader
-      - run: python -m pytest -q
-        working-directory: algo_trader
+
+      - name: Record the runner OS and architecture
+        run: python -c "import platform, sys; print(platform.platform()); print('machine:', platform.machine()); print('python:', sys.version)"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+
+      - name: Check dependency resolution
+        run: python -m pip check
+
+      - name: Check runtime imports
+        run: python -c "import alpaca, gymnasium, lumibot, numpy, pandas, torch; print('runtime imports OK')"
+
+      - name: Compile every module
+        run: python -m compileall -q .
+
+      - name: Run the test suite
+        run: python -m pytest -q
+
+      # The remaining steps exercise the shared Local/Colab training contract
+      # end to end on CPU: train, resume, evaluate, verify, and CPU load.
+      - name: Train on CPU
+        run: python -m colab.deepscalper.training train --synthetic --tiny --epochs 1 --symbol AAPL --location local --device cpu --output-dir ci-run
+
+      - name: Resume from the last checkpoint
+        run: python -m colab.deepscalper.training train --synthetic --tiny --epochs 2 --resume --symbol AAPL --location local --device cpu --output-dir ci-run
+
+      - name: Evaluate on the untouched holdout
+        run: python -m colab.deepscalper.training evaluate --checkpoint ci-run/best.pth --manifest ci-run/best.manifest.json --synthetic --split holdout --device cpu
+
+      - name: Verify the artifact
+        run: python -m colab.deepscalper.training verify --checkpoint ci-run/best.pth --manifest ci-run/best.manifest.json
+
+      - name: Load on CPU and confirm the artifact cannot be promoted
+        run: python -m scripts.verify_artifact_cpu --checkpoint ci-run/best.pth --manifest ci-run/best.manifest.json --expect-rejected
