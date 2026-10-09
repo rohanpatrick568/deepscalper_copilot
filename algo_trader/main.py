@@ -15,6 +15,7 @@ Shutdown:
     shutdown of the Lumibot thread before the process exits.
 """
 
+import argparse
 import logging
 import os
 import sys
@@ -199,8 +200,49 @@ def _run_dashboard(bridge, controller: EngineController) -> int:
     return exit_code
 
 
-def main() -> int:
+def run_training_setup() -> int:
+    """Open the Local/Colab training chooser without a model or credentials.
+
+    This path deliberately skips environment validation so a new user can
+    train a first model before any approved weights or broker keys exist.
+    """
+    from PyQt5.QtWidgets import QApplication, QLabel, QMainWindow, QVBoxLayout, QWidget
+
+    from dashboard.training_choice import TrainingChoice
+
+    logger.info("Opening the training setup window (no model or broker required).")
+    app = QApplication.instance() or QApplication(sys.argv)
+    window = QMainWindow()
+    window.setWindowTitle("DeepScalper — Training setup")
+    container = QWidget(window)
+    layout = QVBoxLayout(container)
+    layout.addWidget(
+        QLabel(
+            "Choose where to train. Local runs on this machine's CPU; Google "
+            "Colab opens the launcher notebook you authorize yourself.\n"
+            "Neither option needs Alpaca credentials or an approved model."
+        )
+    )
+    layout.addWidget(TrainingChoice(parent=container))
+    layout.addStretch(1)
+    window.setCentralWidget(container)
+    window.resize(1100, 180)
+    window.show()
+    return app.exec_()
+
+
+def main(argv: list[str] | None = None) -> int:
     """Main entry point — validates, starts threads, runs Qt event loop."""
+    parser = argparse.ArgumentParser(prog="main.py", description=__doc__)
+    parser.add_argument(
+        "--training-setup",
+        action="store_true",
+        help="open the Local/Colab training chooser without a model or credentials",
+    )
+    args = parser.parse_args(argv)
+    if args.training_setup:
+        return run_training_setup()
+
     logger.info("AlgoTrader starting up…")
 
     # Validate before doing anything else

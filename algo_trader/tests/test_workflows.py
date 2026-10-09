@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import json
 from datetime import datetime, time, timezone
+from pathlib import Path
 from decimal import Decimal
 from types import SimpleNamespace
 
@@ -336,3 +338,73 @@ def test_engine_controller_surfaces_failure_and_requires_confirmed_shutdown():
     assert controller.close_position("AAPL")
     assert controller.shutdown(timeout_seconds=1)
     assert controller.shutdown_confirmed is True
+
+
+def test_local_and_colab_share_the_same_training_command():
+    """Both locations run one shared CLI and produce one artifact format."""
+    from workflow import training_launch_plan
+
+    local = training_launch_plan("local", data=Path("AAPL_features.npz"))
+    colab = training_launch_plan("colab", data=Path("/content/AAPL_features.npz"))
+
+    assert local["module"] == colab["module"] == "colab.deepscalper.training"
+    assert local["argv"][0] == colab["argv"][0] == "train"
+    assert local["credentials_required"] is False
+    assert colab["credentials_required"] is False
+
+    def without_paths(argv):
+        return [item for item in argv if "features.npz" not in item and "/" not in item]
+
+    assert without_paths(local["argv"]) == [
+        item if item != "colab" else "local" for item in without_paths(colab["argv"])
+    ]
+
+
+def test_colab_plan_never_claims_to_launch_remote_compute():
+    from workflow import training_launch_plan
+
+    colab = training_launch_plan("colab")
+    assert colab["runs_here"] is False
+    assert colab["notebook"].endswith("03_train_deepscalper.ipynb")
+    assert colab["notebook_url"].startswith("https://colab.research.google.com/")
+    assert training_launch_plan("local")["runs_here"] is True
+
+
+def test_training_launch_plan_rejects_an_unknown_location():
+    from workflow import training_launch_plan
+
+    with pytest.raises(ValueError, match="local"):
+        training_launch_plan("aws")
+
+
+def test_setup_reports_the_resolved_cpu_device(tmp_path, capsys):
+    from workflow import main
+
+    assert main(["setup", "--location", "local", "--output-dir", str(tmp_path)]) == 0
+    result = json.loads(capsys.readouterr().out)
+    assert result["device"] == "cpu"
+    assert result["runs_here"] is True
+    assert result["credentials_required"] is False
+
+
+def test_workflow_train_for_colab_prints_the_plan_without_training(tmp_path, capsys):
+    from workflow import main
+
+    assert (
+        main(
+            [
+                "train",
+                "--location",
+                "colab",
+                "--data",
+                str(tmp_path / "missing.npz"),
+                "--output-dir",
+                str(tmp_path / "runs"),
+            ]
+        )
+        == 0
+    )
+    result = json.loads(capsys.readouterr().out)
+    assert result["runs_here"] is False
+    # Nothing was trained locally for a Colab selection.
+    assert not (tmp_path / "runs").exists()

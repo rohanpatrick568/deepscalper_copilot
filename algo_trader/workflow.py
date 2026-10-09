@@ -15,6 +15,73 @@ import torch
 
 from config import LOOKBACK_BARS, MARKET_TIMEZONE, TRADING_UNIVERSE
 
+COLAB_NOTEBOOK = "algo_trader/colab/03_train_deepscalper.ipynb"
+COLAB_NOTEBOOK_URL = (
+    "https://colab.research.google.com/github/rohanpatrick568/deepscalper_copilot/"
+    "blob/fix/supervised-paper-reliability/" + COLAB_NOTEBOOK
+)
+
+
+def training_launch_plan(
+    location: str,
+    *,
+    data: Path | None = None,
+    output_dir: Path = Path("runs/AAPL"),
+    symbol: str = "AAPL",
+    epochs: int = 20,
+    device: str = "cpu",
+    resume: bool = False,
+) -> dict:
+    """Describe the concrete launch route for the user's Local/Colab choice.
+
+    Both locations run the same shared training CLI and produce the same
+    checkpoint/manifest format; only the host differs.
+    """
+    if location not in ("local", "colab"):
+        raise ValueError(f"location must be 'local' or 'colab', not {location!r}")
+    argv = [
+        "train",
+        "--data",
+        str(data) if data is not None else "DATA.npz",
+        "--output-dir",
+        str(output_dir),
+        "--symbol",
+        symbol,
+        "--location",
+        location,
+        "--device",
+        device,
+        "--epochs",
+        str(epochs),
+    ]
+    if resume:
+        argv.append("--resume")
+    plan = {
+        "location": location,
+        "module": "colab.deepscalper.training",
+        "argv": argv,
+        "command": "python -m colab.deepscalper.training " + " ".join(argv),
+        "credentials_required": False,
+        "runs_here": location == "local",
+    }
+    if location == "colab":
+        # Colab compute is started by the user in their own authorized session;
+        # this process never launches a remote job.
+        plan["notebook"] = COLAB_NOTEBOOK
+        plan["notebook_url"] = COLAB_NOTEBOOK_URL
+        plan["next"] = (
+            "Open the notebook, run the bootstrap cell to mount Drive and check "
+            "out this revision, choose the device, then run the training cell. "
+            "Download best.pth and best.manifest.json and import them locally "
+            "with the promote command."
+        )
+    else:
+        plan["next"] = (
+            "Runs on this machine with the command above. Use --resume to "
+            "continue an interrupted run and --cancel-file to stop it cleanly."
+        )
+    return plan
+
 
 def offline_validation() -> dict:
     """Validate shared feature/training imports without credentials or network."""
@@ -141,6 +208,20 @@ def _parser() -> argparse.ArgumentParser:
     )
     setup.add_argument("--location", choices=("local", "colab"), required=True)
     setup.add_argument("--output-dir", type=Path, default=Path("runs/AAPL"))
+    setup.add_argument("--symbol", default=TRADING_UNIVERSE[0])
+    setup.add_argument("--data", type=Path)
+    setup.add_argument("--device", default="cpu")
+
+    train = subparsers.add_parser(
+        "train", help="run the shared training CLI for the selected location"
+    )
+    train.add_argument("--location", choices=("local", "colab"), required=True)
+    train.add_argument("--data", type=Path, required=True)
+    train.add_argument("--output-dir", type=Path, default=Path("runs/AAPL"))
+    train.add_argument("--symbol", default=TRADING_UNIVERSE[0])
+    train.add_argument("--device", default="cpu")
+    train.add_argument("--epochs", type=int, default=20)
+    train.add_argument("--resume", action="store_true")
     smoke = subparsers.add_parser("paper-smoke")
     smoke.add_argument("--confirm-paper-smoke", action="store_true")
     smoke.add_argument("--symbol", default=TRADING_UNIVERSE[0])
@@ -153,19 +234,39 @@ def _parser() -> argparse.ArgumentParser:
 def main(argv=None) -> int:
     args = _parser().parse_args(argv)
     if args.command == "setup":
+        from colab.deepscalper.training import resolve_device
+
         args.output_dir.mkdir(parents=True, exist_ok=True)
-        result = {
-            "location": args.location,
-            "output_dir": str(args.output_dir.resolve()),
-            "credentials_required": False,
-            "next": (
-                "run the shared training CLI with --location local"
-                if args.location == "local"
-                else "open the Colab launcher, authorize Drive, and use --location colab"
-            ),
-        }
+        device, device_note = resolve_device(args.device)
+        result = training_launch_plan(
+            args.location,
+            data=args.data,
+            output_dir=args.output_dir.resolve(),
+            symbol=args.symbol,
+            device=device,
+        )
+        result["output_dir"] = str(args.output_dir.resolve())
+        result["device"] = device
+        result["device_note"] = device_note
         print(json.dumps(result, indent=2, sort_keys=True))
         return 0
+    if args.command == "train":
+        plan = training_launch_plan(
+            args.location,
+            data=args.data,
+            output_dir=args.output_dir,
+            symbol=args.symbol,
+            epochs=args.epochs,
+            device=args.device,
+            resume=args.resume,
+        )
+        if args.location == "colab":
+            # Never pretend to start remote compute the user has not authorized.
+            print(json.dumps(plan, indent=2, sort_keys=True))
+            return 0
+        from colab.deepscalper.training import main as training_main
+
+        return training_main(plan["argv"])
     if args.command == "offline":
         result = offline_validation()
     elif args.command == "dry-run":
