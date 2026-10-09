@@ -92,6 +92,10 @@ if str(_COLAB_PATH) not in sys.path:
 
 from deepscalper.architecture import DeepScalperNet  # noqa: E402
 from deepscalper.utils import compute_micro_features  # noqa: E402
+from colab.deepscalper.policy import (  # noqa: E402
+    PolicyConfig,
+    decide_target_position,
+)
 
 from lumibot.entities import Asset
 from lumibot.strategies import Strategy
@@ -114,6 +118,23 @@ class EquityDeepScalper(Strategy):
     _MIN_TRADES_FOR_KELLY: int = 5
     _ENTRY_Q_EDGE_MIN: float = 0.02
     _ENTRY_CONFIDENCE_MIN: float = 0.58
+
+    @property
+    def execution_policy(self) -> PolicyConfig:
+        """Single source of truth for the decision rules.
+
+        Shared verbatim with the training/approval evaluator so validation
+        reflects the filters, holding period, and cooldown that paper
+        execution actually applies.
+        """
+        return PolicyConfig(
+            long_only=LONG_ONLY,
+            allow_pyramiding=ALLOW_PYRAMIDING,
+            entry_q_edge_min=self._ENTRY_Q_EDGE_MIN,
+            entry_confidence_min=self._ENTRY_CONFIDENCE_MIN,
+            min_hold_bars=MIN_HOLD_BARS,
+            entry_cooldown_bars=ENTRY_COOLDOWN_BARS,
+        )
 
     def __init__(
         self,
@@ -447,13 +468,6 @@ class EquityDeepScalper(Strategy):
         action = int(q_np.argmax())
         confidence = float(F.softmax(torch.from_numpy(q_np), dim=0).max())
 
-        q_short = float(q_np[ACTION_SHORT])
-        q_flat = float(q_np[ACTION_FLAT])
-        q_long = float(q_np[ACTION_LONG])
-
-        long_entry_allowed = (q_long - q_flat) > self._ENTRY_Q_EDGE_MIN and confidence >= self._ENTRY_CONFIDENCE_MIN
-        short_entry_allowed = (q_short - q_flat) > self._ENTRY_Q_EDGE_MIN and confidence >= self._ENTRY_CONFIDENCE_MIN
-
         risk_exit_submitted = False
         if position_flag != 0:
             if position_flag == 1:
@@ -465,39 +479,43 @@ class EquityDeepScalper(Strategy):
 
         self._publish_signal(symbol, action, q_np.tolist(), confidence)
         if risk_exit_submitted:
+            # A protective exit suppresses any model-driven change this iteration.
+            logger.info("%s decision suppressed by protective exit", symbol)
             return
 
-        hold_bars = self._holding_bars(symbol)
-        in_cooldown = self._in_entry_cooldown(symbol)
+        decision = decide_target_position(
+            q_np.tolist(),
+            position_flag,
+            bars_held=self._holding_bars(symbol),
+            bars_since_exit=self._bars_since_exit(symbol),
+            config=self.execution_policy,
+            entries_enabled=entry_allowed,
+        )
+        logger.info(
+            "%s decision=%s target=%s confidence=%.4f position=%s",
+            symbol,
+            decision.reason,
+            decision.target_position,
+            decision.confidence,
+            position_flag,
+        )
+        if not decision.changes_position(position_flag):
+            return
 
-        if action == ACTION_LONG:
-            if position_flag == 1:
-                return
-            if position_flag == -1:
-                if hold_bars >= MIN_HOLD_BARS:
-                    self._submit_exit_flat(symbol, asset, current_price, reason="REVERSE_TO_LONG")
-                return
-            if (
-                entry_allowed
-                and not in_cooldown
-                and long_entry_allowed
-                and not ALLOW_PYRAMIDING
-            ):
-                self._submit_entry(symbol, asset, bars, current_price, portfolio_value, side="buy")
-
-        elif action == ACTION_SHORT:
-            if position_flag == -1:
-                return
-            if position_flag == 1:
-                if hold_bars >= MIN_HOLD_BARS:
-                    self._submit_exit_flat(symbol, asset, current_price, reason="REVERSE_TO_SHORT")
-                return
-            if entry_allowed and not LONG_ONLY and not in_cooldown and short_entry_allowed:
-                self._submit_entry(symbol, asset, bars, current_price, portfolio_value, side="sell")
-
-        else:  # ACTION_FLAT
-            if position_flag != 0 and hold_bars >= MIN_HOLD_BARS:
-                self._submit_exit_flat(symbol, asset, current_price, reason="MODEL_FLAT")
+        if decision.target_position == 0:
+            self._submit_exit_flat(symbol, asset, current_price, reason=decision.reason)
+        elif position_flag != 0:
+            # Reversals close and confirm before any opposite entry is submitted.
+            self._submit_exit_flat(symbol, asset, current_price, reason=decision.reason)
+        else:
+            self._submit_entry(
+                symbol,
+                asset,
+                bars,
+                current_price,
+                portfolio_value,
+                side="buy" if decision.target_position > 0 else "sell",
+            )
 
     def _submit_entry(
         self,
@@ -723,11 +741,17 @@ class EquityDeepScalper(Strategy):
             return MIN_HOLD_BARS
         return max(0, self._iteration_index - entry_iter)
 
-    def _in_entry_cooldown(self, symbol: str) -> bool:
+    def _bars_since_exit(self, symbol: str) -> Optional[int]:
         exit_iter = self._last_exit_iteration.get(symbol)
         if exit_iter is None:
+            return None
+        return max(0, self._iteration_index - exit_iter)
+
+    def _in_entry_cooldown(self, symbol: str) -> bool:
+        bars_since_exit = self._bars_since_exit(symbol)
+        if bars_since_exit is None:
             return False
-        return (self._iteration_index - exit_iter) < ENTRY_COOLDOWN_BARS
+        return bars_since_exit < ENTRY_COOLDOWN_BARS
 
     def _compute_trailing_stop(self, symbol: str, bars: pd.DataFrame, current_price: float, side: str) -> Optional[float]:
         if len(bars) < 2:

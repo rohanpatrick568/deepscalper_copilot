@@ -158,7 +158,7 @@ def test_paper_smoke_reports_price_jump_exposure_without_over_cap_cleanup():
     assert error.quantity == Decimal("0.2")
     assert error.estimated_notional == Decimal("40.0")
     assert error.max_order_notional == Decimal("30.0")
-    assert "No over-limit cleanup order was submitted" in str(error)
+    assert "No further smoke orders were submitted" in str(error)
     assert len(client.submitted) == 1
     assert [position.symbol for position in client.positions] == ["MSFT", "AAPL"]
 

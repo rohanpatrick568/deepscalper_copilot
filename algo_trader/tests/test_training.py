@@ -12,13 +12,16 @@ from pathlib import Path
 import pytest
 import numpy as np
 import pandas as pd
+import torch
 
 from colab.deepscalper.data import prepare_features
+from colab.deepscalper.policy import POLICY_VERSION
 from colab.deepscalper.training import (
     MarketData,
     ModelConfig,
     TrainConfig,
     evaluate,
+    promote_model,
     validate_artifact,
 )
 
@@ -69,7 +72,12 @@ def test_tiny_shared_entry_point_resume_and_colab_compatibility(artifact_dir):
     assert best != latest
 
     manifest = validate_artifact(best, manifest_path)
-    assert manifest["accepted"] is True
+    # A tiny untrained run is genuinely flat, so the activity gate must reject
+    # it: a zero-trade policy can never be approved for paper execution.
+    assert manifest["accepted"] is False
+    assert manifest["data_source"] == "synthetic"
+    assert any("position_changes" in reason for reason in manifest["rejections"])
+    assert manifest["policy_schema"]["version"] == POLICY_VERSION
     assert manifest["splits"]["method"] == "chronological"
     assert manifest["splits"]["holdout_used_for_selection"] is False
     assert manifest["selection"]["best_reloaded_before_holdout"] is True
@@ -94,21 +102,15 @@ def test_tiny_shared_entry_point_resume_and_colab_compatibility(artifact_dir):
     )
     assert json.loads(verified.stdout)["valid"] is True
 
+    # Synthetic smoke output must never reach the paper-approved weights dir.
     imported = artifact_dir / "imported"
-    _run(
-        "colab.deepscalper.training",
-        "promote",
-        "--checkpoint",
-        str(best),
-        "--manifest",
-        str(manifest_path),
-        "--weights-dir",
-        str(imported),
-        "--symbol",
-        "AAPL",
-        "--allow-nonproduction",
-    )
-    validate_artifact(imported / "AAPL.pth", imported / "AAPL.manifest.json")
+    with pytest.raises(ValueError, match="accepted"):
+        promote_model(best, manifest_path, imported, symbol="AAPL", allow_nonproduction=True)
+    assert not imported.exists()
+
+    # The checkpoint still loads on CPU regardless of the training device.
+    payload = torch.load(best, map_location="cpu", weights_only=False)
+    assert isinstance(payload, dict)
 
     _run(
         "colab.deepscalper.training",
@@ -206,6 +208,10 @@ def test_evaluation_visits_each_day_once_without_exploration():
             self.explore_values.append(explore)
             return 1, 0
 
+        def action_values(self, observation):
+            self.explore_values.append(False)
+            return np.array([0.0, 1.0, 0.0], dtype=np.float32)
+
     bars_per_day = 15
     days = 3
     count = bars_per_day * days
@@ -237,6 +243,10 @@ def test_training_epoch_visits_every_training_day(monkeypatch):
         def select_action(self, observation, explore):
             self.days.append(int(observation["day"]))
             return 1, 0
+
+        def action_values(self, observation):
+            self.days.append(int(observation["day"]))
+            return np.array([0.0, 1.0, 0.0], dtype=np.float32)
 
         def store(self, *args):
             return None

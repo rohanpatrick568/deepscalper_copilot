@@ -485,6 +485,20 @@ class DeepScalperAgent:
             self.online_net.train()
         return int(q_dir.argmax(1).item()), int(q_size.argmax(1).item())
 
+    def action_values(self, obs: Dict[str, np.ndarray]) -> np.ndarray:
+        """Return greedy direction Q-values without exploration or step counting.
+
+        Evaluation needs the full Q-vector to apply the runtime entry filters
+        (edge and softmax confidence), not only the argmax action.
+        """
+        self.online_net.eval()
+        with torch.no_grad():
+            lob   = torch.tensor(obs['lob'][None],   dtype=torch.float32, device=self.device)
+            priv  = torch.tensor(obs['priv'][None],  dtype=torch.float32, device=self.device)
+            macro = torch.tensor(obs['macro'][None], dtype=torch.float32, device=self.device)
+            q_dir, _q_size = self.online_net(lob, priv, macro)
+        return q_dir.squeeze(0).cpu().numpy()
+
     # ------------------------------------------------------------------
     # Training step — BDQ Double-DQN + PER (TradeMaster-style controls)
     # ------------------------------------------------------------------

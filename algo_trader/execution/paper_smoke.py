@@ -27,22 +27,37 @@ class UnresolvedSmokeExposure(RuntimeError):
         estimated_notional: Decimal | None,
         max_order_notional: Decimal,
         reason: str,
+        order_ids: tuple[str, ...] = (),
+        client_order_ids: tuple[str, ...] = (),
     ) -> None:
         notional = (
             f"${estimated_notional:.2f}"
             if estimated_notional is not None
             else "unknown"
         )
+        identifiers = (
+            f" Orders: {', '.join(order_ids)}." if order_ids else ""
+        )
+        client_identifiers = (
+            f" Client order IDs: {', '.join(client_order_ids)}."
+            if client_order_ids
+            else ""
+        )
         super().__init__(
             f"UNRESOLVED PAPER-SMOKE EXPOSURE: {quantity} {symbol}; "
             f"estimated notional={notional}, order cap=${max_order_notional:.2f}. "
-            f"{reason} No over-limit cleanup order was submitted; inspect the paper "
-            "account and flatten manually."
+            f"{reason} No further smoke orders were submitted."
+            f"{identifiers}{client_identifiers}"
+            " Recover manually: inspect the order(s) above in the Alpaca paper "
+            "dashboard, wait for or cancel any non-terminal order, then flatten "
+            f"the remaining {symbol} quantity yourself."
         )
         self.symbol = symbol
         self.quantity = quantity
         self.estimated_notional = estimated_notional
         self.max_order_notional = max_order_notional
+        self.order_ids = tuple(order_ids)
+        self.client_order_ids = tuple(client_order_ids)
 
 
 def _status(order: Any) -> str:
@@ -75,6 +90,7 @@ def run_paper_round_trip(
     timeout_seconds: float,
     max_orders: int = 2,
     confirmed: bool = False,
+    cleanup_timeout_seconds: float | None = None,
     sleep_fn=time.sleep,
 ) -> dict[str, Any]:
     """Buy a bounded fractional notional and sell only the resulting test position."""
@@ -87,6 +103,15 @@ def run_paper_round_trip(
         raise ValueError(f"Smoke notional must be in (0, {MAX_ORDER_NOTIONAL}]")
     if max_orders != 2:
         raise ValueError("The bounded round trip requires exactly two order slots")
+    if timeout_seconds <= 0:
+        raise ValueError("Paper smoke requires a positive timeout")
+    # The cleanup sell gets its own bounded budget so a slow buy can never
+    # consume the time needed to flatten the resulting position.
+    cleanup_budget = (
+        timeout_seconds if cleanup_timeout_seconds is None else cleanup_timeout_seconds
+    )
+    if cleanup_budget <= 0:
+        raise ValueError("Paper smoke requires a positive cleanup timeout")
     asset = client.get_asset(symbol)
     if not getattr(asset, "tradable", False) or not getattr(asset, "fractionable", False):
         raise RuntimeError(f"{symbol} must be tradable and fractionable for bounded smoke")
@@ -120,22 +145,30 @@ def run_paper_round_trip(
             return client.get_order_by_client_id(client_id)
         return client.get_order_by_id(order.id)
 
-    def wait_terminal(order: Any) -> Any:
+    def wait_terminal(order: Any, budget: float) -> Any:
+        """Poll, then cancel, then re-poll until the broker confirms a terminal state.
+
+        A cancel *request* is never treated as confirmation: the order is only
+        considered resolved once the broker itself reports a terminal status.
+        """
         current = order
-        deadline = time.monotonic() + timeout_seconds
+        deadline = time.monotonic() + budget
         while time.monotonic() < deadline:
             current = lookup(current)
             if _status(current) in TERMINAL:
                 return current
             sleep_fn(0.5)
         client.cancel_order_by_id(current.id)
-        cancel_deadline = time.monotonic() + timeout_seconds
+        cancel_deadline = time.monotonic() + budget
         while time.monotonic() < cancel_deadline:
             current = lookup(current)
             if _status(current) in TERMINAL:
                 return current
             sleep_fn(0.5)
-        raise TimeoutError(f"Paper smoke order {current.id} did not become terminal after cancellation")
+        raise TimeoutError(
+            f"Paper smoke order {current.id} is still {_status(current) or 'unknown'} "
+            "after a cancellation request"
+        )
 
     def submit(request: Any, client_id: str) -> Any:
         try:
@@ -148,25 +181,52 @@ def run_paper_round_trip(
             order.client_order_id = client_id
         return order
 
-    failure: Exception | None = None
+    def live_position() -> Any | None:
+        for position in client.get_all_positions():
+            if _symbol(position) == symbol and Decimal(str(position.qty)) != 0:
+                return position
+        return None
+
+    buy_id = f"{prefix}-buy"
+    buy = submit(
+        MarketOrderRequest(
+            symbol=symbol,
+            notional=notional,
+            side=OrderSide.BUY,
+            time_in_force=TimeInForce.DAY,
+            client_order_id=buy_id,
+        ),
+        buy_id,
+    )
+    own_orders.append(buy)
+
+    # The buy MUST be broker-confirmed terminal before any cleanup is even
+    # calculated: submitting a sell against a still-working buy can oversell.
     try:
-        buy_id = f"{prefix}-buy"
-        buy = submit(
-            MarketOrderRequest(
-                symbol=symbol,
-                notional=notional,
-                side=OrderSide.BUY,
-                time_in_force=TimeInForce.DAY,
-                client_order_id=buy_id,
+        buy = wait_terminal(buy, timeout_seconds)
+    except TimeoutError as exc:
+        stranded = live_position()
+        quantity = Decimal(str(stranded.qty)) if stranded is not None else Decimal("0")
+        raise UnresolvedSmokeExposure(
+            symbol=symbol,
+            quantity=quantity,
+            estimated_notional=(
+                _position_notional(stranded, quantity) if stranded is not None else None
             ),
-            buy_id,
-        )
-        own_orders.append(buy)
-        buy = wait_terminal(buy)
-        if _status(buy) != "filled":
-            raise RuntimeError(f"Paper smoke buy ended as {_status(buy)}")
-    except Exception as exc:
-        failure = exc
+            max_order_notional=Decimal(str(MAX_ORDER_NOTIONAL)),
+            reason=(
+                "The buy never reached a broker-confirmed terminal state, so its "
+                "filled quantity is unknown and no cleanup sell was calculated."
+            ),
+            order_ids=(str(getattr(buy, "id", "unknown")),),
+            client_order_ids=(buy_id,),
+        ) from exc
+
+    own_orders[0] = buy
+    # Reconcile late fills: re-read the broker position now that the buy is terminal.
+    failure: Exception | None = None
+    if _status(buy) != "filled":
+        failure = RuntimeError(f"Paper smoke buy ended as {_status(buy)}")
 
     positions = [
         position
@@ -186,6 +246,8 @@ def run_paper_round_trip(
                 estimated_notional=None,
                 max_order_notional=order_cap,
                 reason="The broker position has no usable current price or market value.",
+                order_ids=(str(getattr(buy, "id", "unknown")),),
+                client_order_ids=(buy_id,),
             ) from failure
         if cleanup_notional > order_cap:
             raise UnresolvedSmokeExposure(
@@ -194,6 +256,8 @@ def run_paper_round_trip(
                 estimated_notional=cleanup_notional,
                 max_order_notional=order_cap,
                 reason="Flattening the full position would exceed the configured per-order cap.",
+                order_ids=(str(getattr(buy, "id", "unknown")),),
+                client_order_ids=(buy_id,),
             ) from failure
         if len(own_orders) >= max_orders:
             raise RuntimeError("Smoke exhausted its bounded order count before flattening") from failure
@@ -209,7 +273,30 @@ def run_paper_round_trip(
             sell_id,
         )
         own_orders.append(sell)
-        sell = wait_terminal(sell)
+        try:
+            sell = wait_terminal(sell, cleanup_budget)
+        except TimeoutError as exc:
+            stranded = live_position()
+            quantity = (
+                Decimal(str(stranded.qty)) if stranded is not None else Decimal("0")
+            )
+            raise UnresolvedSmokeExposure(
+                symbol=symbol,
+                quantity=quantity,
+                estimated_notional=(
+                    _position_notional(stranded, quantity)
+                    if stranded is not None
+                    else None
+                ),
+                max_order_notional=order_cap,
+                reason=(
+                    "The cleanup sell never reached a broker-confirmed terminal "
+                    "state within its own timeout budget."
+                ),
+                order_ids=(str(getattr(buy, "id", "unknown")), str(getattr(sell, "id", "unknown"))),
+                client_order_ids=(buy_id, sell_id),
+            ) from exc
+        own_orders[-1] = sell
         if _status(sell) != "filled":
             raise RuntimeError(f"Paper smoke sell ended as {_status(sell)}") from failure
     elif failure is not None:

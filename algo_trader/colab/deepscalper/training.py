@@ -22,7 +22,14 @@ import torch
 
 from .agent import DeepScalperAgent
 from .environment import ScalperEnv
-from .policy import normalize_action
+from .policy import (
+    POLICY_VERSION,
+    POSITION_TO_ACTION,
+    PolicyConfig,
+    decide_target_position,
+    normalize_action,
+    protective_exit_reason,
+)
 
 ARTIFACT_FORMAT = "deepscalper-shared-v1"
 FEATURE_SCHEMA = {
@@ -56,6 +63,8 @@ REQUIRED_MANIFEST_KEYS = {
     "provenance",
     "feature_schema",
     "action_schema",
+    "policy_schema",
+    "data_source",
     "universe",
 }
 
@@ -333,6 +342,7 @@ def _run_training_epoch(
     *,
     seed: int,
     max_steps: int | None,
+    long_only: bool = True,
 ) -> dict[str, float]:
     rewards: list[float] = []
     losses: list[float] = []
@@ -342,6 +352,10 @@ def _run_training_epoch(
         done = False
         while not done and (max_steps is None or steps < max_steps):
             direction, size = agent.select_action(obs, explore=True)
+            # Training must not explore shorts that execution can never take.
+            direction = normalize_action(
+                direction, int(getattr(env, "_position", 0)), long_only=long_only
+            )
             next_obs, reward, terminated, truncated, info = env.step(direction)
             done = terminated or truncated
             agent.store(obs, direction, size, reward, next_obs, done, info["vol_target"])
@@ -367,22 +381,73 @@ def evaluate(
     training: TrainConfig,
     *,
     seed: int,
+    policy: PolicyConfig | None = None,
 ) -> dict[str, float | int]:
-    """Evaluate greedily with costs, no hindsight/exploration, and liquidation."""
+    """Evaluate greedily under the runtime execution policy.
+
+    Exploration is disabled, every day is visited exactly once, costs and
+    terminal liquidation come from the environment, and entry filters, holding
+    period, cooldown, and protective exits reuse ``decide_target_position`` so
+    approval reflects the rules paper execution applies.
+    """
+    policy = policy or PolicyConfig()
     env = _make_env(data, model, training, is_training=False)
     net_log_returns: list[float] = []
     positions: list[int] = []
     costs = 0.0
     liquidations = 0
     days_visited: list[int] = []
+    reasons: dict[str, int] = {}
+    entries = 0
+    protective_exits = 0
     for day_idx in range(len(env.day_starts)):
         obs, _ = env.reset(seed=seed + day_idx, options={"day_idx": day_idx})
         days_visited.append(day_idx)
         done = False
+        bars_held = policy.min_hold_bars
+        bars_since_exit: int | None = None
+        entry_price = 0.0
+        extreme_price = 0.0
         while not done:
-            direction, _ = agent.select_action(obs, explore=False)
-            direction = normalize_action(direction, int(env._position), long_only=True)
-            obs, reward, terminated, truncated, info = env.step(direction)
+            q_values = agent.action_values(obs)
+            position = int(env._position)
+            price = float(env.close_prices[env._t])
+            if position > 0:
+                extreme_price = max(extreme_price, price) if extreme_price else price
+            elif position < 0:
+                extreme_price = min(extreme_price, price) if extreme_price else price
+            protective = protective_exit_reason(
+                position, entry_price, price, extreme_price, policy
+            )
+            decision = decide_target_position(
+                q_values,
+                position,
+                bars_held=bars_held,
+                bars_since_exit=bars_since_exit,
+                config=policy,
+                protective_exit=protective,
+            )
+            reasons[decision.reason] = reasons.get(decision.reason, 0) + 1
+            if decision.protective:
+                protective_exits += 1
+            target = decision.target_position
+            if target != position:
+                if target == 0:
+                    bars_held = policy.min_hold_bars
+                    bars_since_exit = 0
+                    entry_price = 0.0
+                    extreme_price = 0.0
+                else:
+                    entries += 1
+                    bars_held = 0
+                    bars_since_exit = None
+                    entry_price = price
+                    extreme_price = price
+            elif target != 0:
+                bars_held += 1
+            if bars_since_exit is not None:
+                bars_since_exit += 1
+            obs, reward, terminated, truncated, info = env.step(POSITION_TO_ACTION[target])
             done = terminated or truncated
             net_log_returns.append(float(info["net_log_return"]))
             positions.append(int(info["position"]))
@@ -403,10 +468,13 @@ def evaluate(
         "max_drawdown": float(drawdowns.max()) if len(drawdowns) else 0.0,
         "steps": len(net_log_returns),
         "position_changes": int(np.count_nonzero(np.diff(np.r_[0, positions]))),
+        "entries": entries,
+        "protective_exits": protective_exits,
+        "decision_reasons": reasons,
         "transaction_cost": costs,
         "terminal_liquidations": liquidations,
         "exploration_rate": 0.0,
-        "policy": "long_only_execution_v1",
+        "policy": policy.version,
         "days_visited": days_visited,
     }
 
@@ -448,6 +516,65 @@ def _load_training_checkpoint(agent: DeepScalperAgent, path: Path) -> dict[str, 
     return state
 
 
+def resolve_device(requested: str) -> tuple[str, str]:
+    """Resolve a torch device string, defaulting to CPU.
+
+    ``cpu``  always succeeds and is the supported local default on both macOS
+    (Apple silicon) and Windows.  ``cuda`` is honoured only when a working CUDA
+    build is present and fails loudly otherwise, so a user never silently
+    trains somewhere other than the location they chose.  ``auto`` prefers CUDA
+    when available and otherwise reports an explicit CPU fallback.
+    """
+    choice = (requested or "cpu").strip().lower()
+    available = torch.cuda.is_available()
+    if choice == "auto":
+        if available:
+            return "cuda", "auto-selected CUDA"
+        return "cpu", "auto-selected CPU: no CUDA device is available"
+    if choice.startswith("cuda"):
+        if not available:
+            raise RuntimeError(
+                "CUDA was explicitly requested but is not available. On this machine "
+                "run with --device cpu, or use --device auto to fall back "
+                "automatically. In Colab choose a GPU runtime "
+                "(Runtime > Change runtime type > T4 GPU) and rerun the setup cell."
+            )
+        return choice, "explicitly requested CUDA"
+    if choice != "cpu":
+        raise ValueError(f"unsupported device {requested!r}; use cpu, cuda, or auto")
+    return "cpu", "explicitly requested CPU"
+
+
+def _acceptance_rejections(
+    validation_metrics: Mapping[str, Any],
+    holdout_metrics: Mapping[str, Any],
+    acceptance: Mapping[str, Any],
+) -> list[str]:
+    """List every failed gate so rejection reasons are explicit and auditable."""
+    reasons: list[str] = []
+    minimum_changes = int(acceptance["minimum_position_changes"])
+    for name, metrics, floor in (
+        ("validation", validation_metrics, acceptance["min_validation_return"]),
+        ("holdout", holdout_metrics, acceptance["min_holdout_return"]),
+    ):
+        value = float(metrics["return"])
+        if not np.isfinite(value):
+            reasons.append(f"{name}.return is not finite")
+        elif value < float(floor):
+            reasons.append(f"{name}.return {value:.6f} < required {float(floor):.6f}")
+        changes = int(metrics["position_changes"])
+        if changes < minimum_changes:
+            reasons.append(
+                f"{name}.position_changes {changes} < required {minimum_changes} "
+                "(a flat, zero-trade policy cannot be approved)"
+            )
+    drawdown = float(holdout_metrics["max_drawdown"])
+    limit = float(acceptance["max_holdout_drawdown"])
+    if not np.isfinite(drawdown) or drawdown > limit:
+        reasons.append(f"holdout.max_drawdown {drawdown:.6f} > allowed {limit:.6f}")
+    return reasons
+
+
 def train_shared(
     data: MarketData,
     output_dir: Path,
@@ -463,10 +590,19 @@ def train_shared(
     min_validation_return: float = 0.0,
     min_holdout_return: float = 0.0,
     max_holdout_drawdown: float = 0.10,
+    minimum_position_changes: int = 2,
+    policy: PolicyConfig | None = None,
+    data_source: str = "file",
 ) -> dict[str, Any]:
     """Run the canonical entry point used by both local and Colab launchers."""
+    policy = policy or PolicyConfig()
     if location not in {"local", "colab"}:
         raise ValueError("location must be explicitly selected as local or colab")
+    if minimum_position_changes < 1:
+        raise ValueError(
+            "minimum_position_changes must be at least 1; approval requires "
+            "evidence of actual trading activity"
+        )
     data.validate()
     if data.lob.shape[1] != model.lob_dim or data.macro.shape[1] != model.macro_dim:
         raise ValueError("dataset feature dimensions do not match model configuration")
@@ -505,6 +641,7 @@ def train_shared(
                     "training": signature_training,
                     "features": FEATURE_SCHEMA,
                     "actions": ACTION_SCHEMA,
+                    "policy": policy.schema(),
                 },
                 sort_keys=True,
             ).encode()
@@ -528,6 +665,7 @@ def train_shared(
                 "training": signature_training,
                 "features": FEATURE_SCHEMA,
                 "actions": ACTION_SCHEMA,
+                "policy": policy.schema(),
             },
             sort_keys=True,
         ).encode()
@@ -545,6 +683,7 @@ def train_shared(
             train_env,
             seed=epoch_seed,
             max_steps=training.max_steps_per_epoch,
+            long_only=policy.long_only,
         )
         validation_metrics = evaluate(
             agent,
@@ -552,6 +691,7 @@ def train_shared(
             model,
             training,
             seed=training.seed,
+            policy=policy,
         )
         validation_return = float(validation_metrics["return"])
         if validation_return > best_validation_return or not best_path.exists():
@@ -605,18 +745,22 @@ def train_shared(
         )
     selected_state = _load_training_checkpoint(agent, best_path)
     validation_metrics = evaluate(
-        agent, split_data["validation"], model, training, seed=training.seed
+        agent, split_data["validation"], model, training, seed=training.seed, policy=policy
     )
     holdout_metrics = evaluate(
-        agent, split_data["holdout"], model, training, seed=training.seed
+        agent, split_data["holdout"], model, training, seed=training.seed, policy=policy
     )
-    accepted = (
-        np.isfinite(float(validation_metrics["return"]))
-        and np.isfinite(float(holdout_metrics["return"]))
-        and float(validation_metrics["return"]) >= min_validation_return
-        and float(holdout_metrics["return"]) >= min_holdout_return
-        and float(holdout_metrics["max_drawdown"]) <= max_holdout_drawdown
+    acceptance = {
+        "min_validation_return": min_validation_return,
+        "min_holdout_return": min_holdout_return,
+        "max_holdout_drawdown": max_holdout_drawdown,
+        "minimum_position_changes": minimum_position_changes,
+        "policy_version": policy.version,
+    }
+    rejections = _acceptance_rejections(
+        validation_metrics, holdout_metrics, acceptance
     )
+    accepted = not rejections
     manifest: dict[str, Any] = {
         "format": ARTIFACT_FORMAT,
         "created_at": datetime.now(timezone.utc).isoformat(),
@@ -624,15 +768,13 @@ def train_shared(
         "checkpoint": best_path.name,
         "checkpoint_sha256": file_sha256(best_path),
         "accepted": bool(accepted),
+        "rejections": rejections,
         "universe": [symbol],
         "feature_schema": FEATURE_SCHEMA,
         "action_schema": ACTION_SCHEMA,
-        "acceptance": {
-            "min_validation_return": min_validation_return,
-            "min_holdout_return": min_holdout_return,
-            "max_holdout_drawdown": max_holdout_drawdown,
-            "minimum_position_changes": 0,
-        },
+        "policy_schema": policy.schema(),
+        "data_source": data_source,
+        "acceptance": acceptance,
         "model": asdict(model),
         "training": signature_training,
         "selection": {
@@ -671,6 +813,7 @@ def train_shared(
                         "training": asdict(training),
                         "features": FEATURE_SCHEMA,
                         "actions": ACTION_SCHEMA,
+                        "policy": policy.schema(),
                     },
                     sort_keys=True,
                 ).encode()
@@ -710,6 +853,13 @@ def validate_artifact(checkpoint_path: Path, manifest_path: Path | None = None) 
         raise ValueError("artifact feature schema is incompatible")
     if manifest["action_schema"] != ACTION_SCHEMA:
         raise ValueError("artifact action schema is incompatible")
+    recorded_policy = manifest["policy_schema"]
+    if recorded_policy.get("version") != POLICY_VERSION:
+        raise ValueError(
+            f"artifact policy {recorded_policy.get('version')!r} predates the current "
+            f"{POLICY_VERSION!r} execution semantics; re-evaluate the checkpoint "
+            "before promotion"
+        )
     return manifest
 
 
@@ -724,7 +874,13 @@ def promote_model(
     """Import an accepted artifact into runtime weights after strict validation."""
     manifest = validate_artifact(checkpoint_path, manifest_path)
     if not manifest["accepted"]:
-        raise ValueError("only accepted models may be promoted")
+        reasons = manifest.get("rejections") or ["acceptance gates were not met"]
+        raise ValueError(f"only accepted models may be promoted: {'; '.join(reasons)}")
+    if manifest["data_source"] != "file" and not allow_nonproduction:
+        raise ValueError(
+            f"artifact was trained on {manifest['data_source']!r} data and must never "
+            "become a paper-approved model; retrain on real market data"
+        )
     target_symbol = symbol or str(manifest["symbol"])
     if symbol is not None and symbol != manifest["symbol"]:
         raise ValueError("promotion symbol must match the manifest")
@@ -758,7 +914,11 @@ def _parser() -> argparse.ArgumentParser:
     train.add_argument("--symbol", default="AAPL")
     train.add_argument("--epochs", type=int, default=20)
     train.add_argument("--seed", type=int, default=42)
-    train.add_argument("--device", default="cpu")
+    train.add_argument(
+        "--device",
+        default="cpu",
+        help="cpu (default), cuda, or auto; auto falls back to CPU and reports it",
+    )
     train.add_argument("--location", choices=("local", "colab"), required=True)
     train.add_argument("--resume", action="store_true")
     train.add_argument("--cancel-file", type=Path)
@@ -766,6 +926,11 @@ def _parser() -> argparse.ArgumentParser:
     train.add_argument("--min-validation-return", type=float)
     train.add_argument("--min-holdout-return", type=float)
     train.add_argument("--max-holdout-drawdown", type=float)
+    train.add_argument(
+        "--min-position-changes",
+        type=int,
+        help="required position changes on validation and holdout (default 2)",
+    )
 
     verify = subparsers.add_parser("verify", help="validate manifest and checksum")
     verify.add_argument("--checkpoint", type=Path, required=True)
@@ -779,6 +944,7 @@ def _parser() -> argparse.ArgumentParser:
     evaluation.add_argument("--manifest", type=Path, required=True)
     evaluation.add_argument("--split", choices=("validation", "holdout"), default="holdout")
     evaluation.add_argument("--device", default="cpu")
+    evaluation.add_argument("--json-indent", type=int, default=None)
 
     promote = subparsers.add_parser("promote", help="import an accepted model")
     promote.add_argument("--checkpoint", type=Path, required=True)
@@ -820,12 +986,20 @@ def main(argv: Sequence[str] | None = None) -> int:
             training.validation_fraction,
             minimum_bars=model.lookback_bars + 2,
         )
-        agent = _make_agent(model, training, args.device)
+        device, device_note = resolve_device(args.device)
+        agent = _make_agent(model, training, device)
         _load_training_checkpoint(agent, args.checkpoint)
         metrics = evaluate(
-            agent, splits[args.split], model, training, seed=training.seed
+            agent,
+            splits[args.split],
+            model,
+            training,
+            seed=training.seed,
+            policy=PolicyConfig(**manifest["policy_schema"]),
         )
-        print(json.dumps(metrics, sort_keys=True))
+        metrics["device"] = device
+        metrics["device_note"] = device_note
+        print(json.dumps(metrics, sort_keys=True, indent=args.json_indent))
         return 0
     if args.command == "promote":
         checkpoint, manifest = promote_model(
@@ -869,15 +1043,20 @@ def main(argv: Sequence[str] | None = None) -> int:
         seed=args.seed,
         max_steps_per_epoch=max_steps,
     )
+    # --tiny is a plumbing smoke run: gates are relaxed so the pipeline can be
+    # exercised, and the artifact is tagged so it can never be promoted.
     thresholds = (
-        (-1.0, -1.0, 1.0)
+        (-1.0, -1.0, 1.0, 1)
         if args.tiny
         else (
             0.0 if args.min_validation_return is None else args.min_validation_return,
             0.0 if args.min_holdout_return is None else args.min_holdout_return,
             0.10 if args.max_holdout_drawdown is None else args.max_holdout_drawdown,
+            2 if args.min_position_changes is None else args.min_position_changes,
         )
     )
+    device, device_note = resolve_device(args.device)
+    print(json.dumps({"device": device, "device_note": device_note}), file=sys.stderr)
     try:
         manifest = train_shared(
             data,
@@ -885,7 +1064,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             symbol=args.symbol,
             model=model,
             training=training,
-            device=args.device,
+            device=device,
             location=args.location,
             cancel_path=args.cancel_file,
             progress=lambda update: print(
@@ -895,6 +1074,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             min_validation_return=thresholds[0],
             min_holdout_return=thresholds[1],
             max_holdout_drawdown=thresholds[2],
+            minimum_position_changes=thresholds[3],
+            data_source="synthetic" if args.synthetic else "file",
         )
     except (TrainingCancelled, KeyboardInterrupt) as exc:
         print(f"training canceled: {exc}", file=sys.stderr)
@@ -903,13 +1084,26 @@ def main(argv: Sequence[str] | None = None) -> int:
         json.dumps(
             {
                 "accepted": manifest["accepted"],
+                "rejections": manifest["rejections"],
+                "data_source": manifest["data_source"],
+                "device": device,
+                "validation_position_changes": manifest["metrics"]["validation"][
+                    "position_changes"
+                ],
+                "holdout_position_changes": manifest["metrics"]["holdout"][
+                    "position_changes"
+                ],
                 "checkpoint": str(Path(args.output_dir) / "best.pth"),
                 "manifest": str(Path(args.output_dir) / "best.manifest.json"),
             },
             sort_keys=True,
         )
     )
-    return 0 if manifest["accepted"] else 2
+    if manifest["accepted"]:
+        return 0
+    # --tiny is an explicitly non-promotable plumbing run: the pipeline
+    # succeeded even though the model is (correctly) not approved.
+    return 0 if args.tiny else 2
 
 
 if __name__ == "__main__":
