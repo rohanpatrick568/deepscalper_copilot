@@ -35,6 +35,9 @@ class FakePaperClient:
             status="active",
         )
 
+    def get_clock(self):
+        return SimpleNamespace(is_open=True)
+
     def get_all_positions(self):
         return list(self.positions)
 
@@ -48,6 +51,7 @@ class FakePaperClient:
             symbol=fields["symbol"],
             side=fields["side"],
             status="filled",
+            client_order_id=fields.get("client_order_id"),
         )
         self.submitted.append(fields)
         self.orders[order.id] = order
@@ -80,6 +84,14 @@ def test_offline_and_dry_run_need_no_credentials_or_network():
         "broker_submissions": 0,
         "signals": 1,
     }
+
+
+def test_setup_is_reachable_without_credentials(tmp_path, capsys):
+    from workflow import main
+
+    assert main(["setup", "--location", "local", "--output-dir", str(tmp_path)]) == 0
+    output = capsys.readouterr().out
+    assert '"credentials_required": false' in output
 
 
 def test_bounded_paper_smoke_reconciles_only_its_symbol():

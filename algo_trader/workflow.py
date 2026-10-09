@@ -136,6 +136,11 @@ def _parser() -> argparse.ArgumentParser:
     subparsers.add_parser("offline")
     subparsers.add_parser("preflight")
     subparsers.add_parser("dry-run")
+    setup = subparsers.add_parser(
+        "setup", help="prepare a local or Colab training workspace without credentials"
+    )
+    setup.add_argument("--location", choices=("local", "colab"), required=True)
+    setup.add_argument("--output-dir", type=Path, default=Path("runs/AAPL"))
     smoke = subparsers.add_parser("paper-smoke")
     smoke.add_argument("--confirm-paper-smoke", action="store_true")
     smoke.add_argument("--symbol", default=TRADING_UNIVERSE[0])
@@ -147,6 +152,20 @@ def _parser() -> argparse.ArgumentParser:
 
 def main(argv=None) -> int:
     args = _parser().parse_args(argv)
+    if args.command == "setup":
+        args.output_dir.mkdir(parents=True, exist_ok=True)
+        result = {
+            "location": args.location,
+            "output_dir": str(args.output_dir.resolve()),
+            "credentials_required": False,
+            "next": (
+                "run the shared training CLI with --location local"
+                if args.location == "local"
+                else "open the Colab launcher, authorize Drive, and use --location colab"
+            ),
+        }
+        print(json.dumps(result, indent=2, sort_keys=True))
+        return 0
     if args.command == "offline":
         result = offline_validation()
     elif args.command == "dry-run":

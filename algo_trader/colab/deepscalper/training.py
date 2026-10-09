@@ -22,6 +22,7 @@ import torch
 
 from .agent import DeepScalperAgent
 from .environment import ScalperEnv
+from .policy import normalize_action
 
 ARTIFACT_FORMAT = "deepscalper-shared-v1"
 FEATURE_SCHEMA = {
@@ -250,6 +251,7 @@ def _save_checkpoint(
     best_validation_return: float,
     model: ModelConfig,
     training: TrainConfig,
+    run_signature: str | None = None,
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     partial = path.with_suffix(path.suffix + ".partial")
@@ -263,6 +265,7 @@ def _save_checkpoint(
                 "completed_epoch": epoch,
                 "best_validation_return": best_validation_return,
                 "steps": agent._steps,
+                "run_signature": run_signature,
             },
             "model_config": asdict(model),
             "train_config": asdict(training),
@@ -378,6 +381,7 @@ def evaluate(
         done = False
         while not done:
             direction, _ = agent.select_action(obs, explore=False)
+            direction = normalize_action(direction, int(env._position), long_only=True)
             obs, reward, terminated, truncated, info = env.step(direction)
             done = terminated or truncated
             net_log_returns.append(float(info["net_log_return"]))
@@ -402,6 +406,7 @@ def evaluate(
         "transaction_cost": costs,
         "terminal_liquidations": liquidations,
         "exploration_rate": 0.0,
+        "policy": "long_only_execution_v1",
         "days_visited": days_visited,
     }
 
@@ -482,6 +487,8 @@ def train_shared(
     )
     _seed_everything(training.seed)
     agent = _make_agent(model, training, device)
+    signature_training = asdict(training)
+    signature_training.pop("epochs", None)
     start_epoch = 0
     best_validation_return = float("-inf")
     resumed = False
@@ -489,11 +496,42 @@ def train_shared(
         if not latest_path.is_file():
             raise FileNotFoundError(f"resume requested but {latest_path} does not exist")
         state = _load_training_checkpoint(agent, latest_path)
+        expected_signature = hashlib.sha256(
+            json.dumps(
+                {
+                    "symbol": symbol,
+                    "data": data_sha256(data),
+                    "model": asdict(model),
+                    "training": signature_training,
+                    "features": FEATURE_SCHEMA,
+                    "actions": ACTION_SCHEMA,
+                },
+                sort_keys=True,
+            ).encode()
+        ).hexdigest()
+        if state.get("run_signature") != expected_signature:
+            raise ValueError(
+                "resume artifact does not match symbol/data/config; start a new run "
+                "or explicitly migrate the checkpoint"
+            )
         start_epoch = int(state.get("completed_epoch", -1)) + 1
         best_validation_return = float(state.get("best_validation_return", float("-inf")))
         resumed = True
 
     history: list[dict[str, Any]] = []
+    run_signature = hashlib.sha256(
+        json.dumps(
+            {
+                "symbol": symbol,
+                "data": data_sha256(data),
+                "model": asdict(model),
+                "training": signature_training,
+                "features": FEATURE_SCHEMA,
+                "actions": ACTION_SCHEMA,
+            },
+            sort_keys=True,
+        ).encode()
+    ).hexdigest()
     train_env = _make_env(split_data["train"], model, training, is_training=True)
     for epoch in range(start_epoch, training.epochs):
         if cancel_path is not None and Path(cancel_path).exists():
@@ -525,6 +563,7 @@ def train_shared(
                 best_validation_return=best_validation_return,
                 model=model,
                 training=training,
+                run_signature=run_signature,
             )
         _save_checkpoint(
             latest_path,
@@ -533,6 +572,7 @@ def train_shared(
             best_validation_return=best_validation_return,
             model=model,
             training=training,
+            run_signature=run_signature,
         )
         history.append(
             {"epoch": epoch, "train": train_metrics, "validation": validation_metrics}
@@ -545,6 +585,7 @@ def train_shared(
                 "best_validation_return": best_validation_return,
                 "latest_checkpoint": latest_path.name,
                 "best_checkpoint": best_path.name,
+                "run_signature": run_signature,
             },
         )
         if progress is not None:
@@ -590,9 +631,10 @@ def train_shared(
             "min_validation_return": min_validation_return,
             "min_holdout_return": min_holdout_return,
             "max_holdout_drawdown": max_holdout_drawdown,
+            "minimum_position_changes": 0,
         },
         "model": asdict(model),
-        "training": asdict(training),
+        "training": signature_training,
         "selection": {
             "criterion": "validation.return",
             "best_epoch": int(selected_state.get("completed_epoch", -1)),

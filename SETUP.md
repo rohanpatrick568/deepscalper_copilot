@@ -9,8 +9,9 @@ of fixed risk-capped sizing.
 Use 64-bit Python 3.12:
 
 ```powershell
-git clone https://github.com/rohanpatrick568/deepscalper_copilot.git
+git clone --branch fix/supervised-paper-reliability --single-branch https://github.com/rohanpatrick568/deepscalper_copilot.git
 cd .\deepscalper_copilot
+git rev-parse --verify HEAD
 py -3.12 -m venv .venv
 & .\.venv\Scripts\python.exe -m pip install --upgrade pip
 & .\.venv\Scripts\python.exe -m pip install -r .\algo_trader\requirements.txt
@@ -34,6 +35,13 @@ cd .\algo_trader
 
 `dry-run` executes a real strategy decision and creates an in-memory order,
 while the broker boundary remains untouched.
+
+To expose the training choice before credentials or model weights exist:
+
+```powershell
+& ..\.venv\Scripts\python.exe -m workflow setup --location local
+& ..\.venv\Scripts\python.exe -m workflow setup --location colab
+```
 
 ## 3. Read-only Alpaca preflight
 
@@ -129,15 +137,19 @@ compute.
 
 1. Open [`algo_trader/colab/01_fetch_training_data.ipynb`](algo_trader/colab/01_fetch_training_data.ipynb)
    in Colab.
-2. Mount Drive, clone the repository, install `requirements-core.txt`, and add
-   `ALPACA_API_KEY`/`ALPACA_SECRET_KEY` to Colab secrets.
-3. Run notebooks 01 and 02. They call the same `deepscalper.data` package and
+2. The launcher mounts/remounts Drive, checks out
+   `fix/supervised-paper-reliability`, prints the checked-out SHA, and installs
+   `requirements-core.txt`. Re-running the cell fetches and fast-forwards the
+   same branch instead of cloning `main`.
+3. Add `ALPACA_API_KEY`/`ALPACA_SECRET_KEY` to Colab secrets only for the
+   credentialed data-fetch cell; synthetic training needs neither.
+4. Run notebooks 01 and 02. They call the same `deepscalper.data` package and
    persist raw data and `AAPL_features.npz` in Drive.
-4. In notebook 03, leave `--location colab` explicit. Set `RESUME=True`; after
+5. In notebook 03, leave `--location colab` explicit. Set `RESUME=True`; after
    interruption it reuses Drive-backed `latest.pth`.
-5. Run notebook 05 for greedy holdout evaluation, then notebook 04 to validate
+6. Run notebook 05 for greedy holdout evaluation, then notebook 04 to validate
    and export the accepted best checkpoint plus manifest.
-6. Download `best.pth` and `best.manifest.json` from Drive to a local staging
+7. Download `best.pth` and `best.manifest.json` from Drive to a local staging
    directory and run the same `verify` and `promote` commands shown above.
 
 Colab GPU availability, Drive authorization, data entitlement, and the

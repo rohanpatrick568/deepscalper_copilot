@@ -13,10 +13,12 @@ class TrainingChoice(QWidget):
 
     COMMANDS = {
         "Local": (
+            "python -m workflow setup --location local; "
             "python -m colab.deepscalper.training train --data DATA.npz "
             "--output-dir runs/AAPL --symbol AAPL --location local"
         ),
         "Google Colab": (
+            "python -m workflow setup --location colab; "
             "python -m colab.deepscalper.training train --data /content/drive/DATA.npz "
             "--output-dir /content/drive/MyDrive/deepscalper/AAPL --symbol AAPL "
             "--location colab"
